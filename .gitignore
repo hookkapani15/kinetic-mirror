@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs and debug files
+*.log
+debug_*.log
+gui_debug*.log
+*.jsonl
+
+# Test outputs
+debug_*.png
+test_*.png
+
+# Config (may contain sensitive data)
+config/config.json
+
+# Firmware build artifacts
+firmware/**/.pio/
+firmware/**/build/
+*.bin
+*.elf
+*.hex
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.bak
+*~
+

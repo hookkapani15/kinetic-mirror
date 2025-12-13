@@ -134,7 +134,7 @@ HEALTH_LOG = LOG_DIR / "health_log.jsonl"
 
 class MirrorGUI:
     def __init__(self):
-        self.mode = "README"
+        self.mode = "LED_TEST"  # Start in LED test mode to verify panel placement
         self.running = True
         self.camera_index = config['camera_index']
         self.available_cameras = []
@@ -146,12 +146,9 @@ class MirrorGUI:
         self.last_serial_send_time = 0
         self.serial_min_interval = 0.05  # Max 20 packets per second
         
-        # Initialize hardware
-        self.motor = MotorController(
-            num_servos=config['num_servos'],
-            angle_min=config['angle_min'],
-            angle_max=config['angle_max']
-        )
+        # Initialize motor controller (32 servos across 2 PCA9685 boards)
+        self.motor = MotorController(num_servos=32)
+        print("✅ Motor controller initialized (32 servos)")
         self.led = LEDController(
             width=config['led_width'],
             height=config['led_height']
@@ -166,7 +163,7 @@ class MirrorGUI:
                 min_detection_confidence=0.7,
                 min_tracking_confidence=0.8,
                 model_complexity=0,
-                enable_segmentation=False, # DISABLED TO PREVENT CRASHES
+                enable_segmentation=True,  # ENABLED for silhouette visualization
                 smooth_landmarks=False
             )
         else:
@@ -242,6 +239,96 @@ class MirrorGUI:
             print(f"✓ Switched to camera {new_camera}")
         else:
             print("⚠ Only one camera available")
+    
+    def _generate_numbers_pattern(self):
+        """Generate pattern with numbers 1-8 on each panel"""
+        pattern = np.zeros((64, 32), dtype=np.uint8)
+        
+        for panel_id in range(1, 9):
+            panel_idx = panel_id - 1
+            row = panel_idx // 2
+            col = panel_idx % 2
+            
+            y_start = row * 16
+            x_start = col * 16
+            
+            # Draw number on panel
+            panel_img = np.zeros((16, 16),dtype=np.uint8)
+            text = str(panel_id)
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            font_scale = 0.7
+            thickness = 2
+            
+            (text_width, text_height), baseline = cv2.getTextSize(text, font, font_scale, thickness)
+            x = (16 - text_width) // 2
+            y = (16 + text_height) // 2
+            
+            cv2.putText(panel_img, text, (x, y), font, font_scale, 255, thickness)
+            pattern[y_start:y_start+16, x_start:x_start+16] = panel_img
+        
+        return pattern
+    
+    def _generate_human_silhouette(self, position='center'):
+        """Generate simple human silhouette"""
+        pattern = np.zeros((64, 32), dtype=np.uint8)
+        
+        if position == 'center':
+            x_offset = 8
+        elif position == 'left':
+            x_offset = 2
+        else:  # right
+            x_offset = 18
+        
+        # Simple stick figure
+        cv2.circle(pattern, (x_offset + 8, 8), 4, 200, -1)
+        cv2.rectangle(pattern, (x_offset + 6, 12), (x_offset + 10, 30), 200, -1)
+        cv2.line(pattern, (x_offset + 6, 16), (x_offset + 2, 24), 200, 2)
+        cv2.line(pattern, (x_offset + 10, 16), (x_offset + 14, 24), 200, 2)
+        cv2.line(pattern, (x_offset + 7, 30), (x_offset + 4, 45), 200, 2)
+        cv2.line(pattern, (x_offset + 9, 30), (x_offset + 12, 45), 200, 2)
+        
+        return pattern
+    
+    def _generate_wave_pattern(self, offset=0):
+        """Generate animated wave"""
+        pattern = np.zeros((64, 32), dtype=np.uint8)
+        
+        for y in range(64):
+            for x in range(32):
+                wave_x = np.sin((x + offset) * 0.3) * 10 + 32
+                wave_y = np.sin(y * 0.2) * 5 + 32
+                dist = abs(y - wave_x) + abs(x - wave_y)
+                brightness = max(0, 255 - int(dist * 8))
+                pattern[y, x] = brightness
+        
+        return pattern
+    
+    def _generate_hello_text(self, text='HELLO'):
+        """Generate text display pattern"""
+        pattern = np.zeros((64, 32), dtype=np.uint8)
+        
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        
+        if len(text) == 1:
+            # Single letter - large and centered
+            font_scale = 2.0
+            thickness = 3
+        else:
+            # Full word - fit to width
+            font_scale = 0.8
+            thickness = 2
+        
+        # Get text size
+        (text_width, text_height), baseline = cv2.getTextSize(text, font, font_scale, thickness)
+        
+        # Center text
+        x = (32 - text_width) // 2
+        y = (64 + text_height) // 2
+        
+        # Draw white text
+        cv2.putText(pattern, text, (x, y), font, font_scale, 255, thickness)
+        
+        return pattern
     
     def run_diagnostics(self):
         """Run automated diagnostics using strict SystemTester"""
@@ -826,7 +913,197 @@ class MirrorGUI:
                     continue
                 
                 # Process based on mode
-                if self.mode == "README":
+                if self.mode == "LED_TEST":
+                    # LED TEST MODE: Display simple geometric patterns (based on working patterns 10, 11)
+                    from packages.mirror_core.testing.led_panel_tester import LEDPanelTester
+                    from packages.mirror_core.testing import simple_led_patterns
+                    
+                    if not hasattr(self, 'led_tester'):
+                        self.led_tester = LEDPanelTester()
+                        self.test_pattern_index = 0
+                        # Organized test patterns with category ranges
+                        self.test_patterns = [
+                            # STATIC BASELINE TESTS (0-4)
+                            ('STATIC', 'all_white', 'All LEDs white - Full system check'),
+                            ('STATIC', 'brightness_levels', 'Panels 1-8 brightness gradient (30→255)'),
+                            ('STATIC', 'checkerboard', 'Checkerboard pattern - Pixel alignment test'),
+                            ('STATIC', 'gradient', 'Horizontal gradient - Smooth transition test'),
+                            ('STATIC', 'borders', 'Panel borders - 2×4 grid verification'),
+                            
+                            # GEOMETRIC TESTS (5-9)
+                            ('GEOMETRIC', 'vertical_bars', 'Vertical stripes - Column wiring test'),
+                            ('GEOMETRIC', 'horizontal_bars', 'Horizontal stripes - Row wiring test'),
+                            ('GEOMETRIC', 'diagonal_gradient', 'Diagonal gradient - Cross-panel test'),
+                            ('GEOMETRIC', 'concentric', 'Concentric squares - Radial pattern'),
+                            ('GEOMETRIC', 'panel_corners', 'Corner markers - Panel identification'),
+                            
+                            # INDIVIDUAL PANEL TESTS (10-17)
+                            ('INDIVIDUAL', 'panel_1', 'Panel 1 ONLY - Top-Left'),
+                            ('INDIVIDUAL', 'panel_2', 'Panel 2 ONLY - Top-Right'),
+                            ('INDIVIDUAL', 'panel_3', 'Panel 3 ONLY - Middle-Top-Left'),
+                            ('INDIVIDUAL', 'panel_4', 'Panel 4 ONLY - Middle-Top-Right'),
+                            ('INDIVIDUAL', 'panel_5', 'Panel 5 ONLY - Middle-Bottom-Left'),
+                            ('INDIVIDUAL', 'panel_6', 'Panel 6 ONLY - Middle-Bottom-Right'),
+                            ('INDIVIDUAL', 'panel_7', 'Panel 7 ONLY - Bottom-Left'),
+                            ('INDIVIDUAL', 'panel_8', 'Panel 8 ONLY - Bottom-Right'),
+                            
+                            # NUMBERS TEST (18)
+                            ('NUMBERS', 'numbers_1_8', 'Display numbers 1-8 on each panel'),
+                            
+                            # TEXT TESTS (19-23)
+                            ('TEXT', 'hello_full', 'Display HELLO across full screen'),
+                            ('TEXT', 'hello_letter_h', 'Display letter H only'),
+                            ('TEXT', 'hello_letter_e', 'Display letter E only'),
+                            ('TEXT', 'hello_letter_l', 'Display letter L only'),
+                            ('TEXT', 'hello_letter_o', 'Display letter O only'),
+                            
+                            # HUMAN SIMULATION TESTS (24-27)
+                            ('HUMAN_SIM', 'human_center', 'Human silhouette - Center position'),
+                            ('HUMAN_SIM', 'human_left', 'Human silhouette - Left position'),
+                            ('HUMAN_SIM', 'human_right', 'Human silhouette - Right position'),
+                            ('HUMAN_SIM', 'human_wave', 'Animated wave pattern - Motion test'),
+                        ]
+                    
+                    # Get current test pattern
+                    category, pattern_name, description = self.test_patterns[self.test_pattern_index]
+                    
+                    # Generate pattern based on name
+                    if pattern_name == 'all_white':
+                        led_pattern = np.full((64, 32), 255, dtype=np.uint8)
+                        what_to_see = "All LEDs bright white"
+                    elif pattern_name == 'brightness_levels':
+                        led_pattern = self.led_tester.generate_panel_test_pattern()
+                        what_to_see = "8 panels from dim (top-left) to bright (bottom-right)"
+                    elif pattern_name == 'checkerboard':
+                        led_pattern = self.led_tester.generate_checkerboard_test()
+                        what_to_see = "Alternating checkerboard squares"
+                    elif pattern_name == 'gradient':
+                        led_pattern = self.led_tester.generate_gradient_test()
+                        what_to_see = "Smooth horizontal gradient left→right"
+                    elif pattern_name == 'borders':
+                        led_pattern = self.led_tester.generate_panel_border_test()
+                        what_to_see = "White grid lines showing 2×4 panel layout"
+                    elif pattern_name == 'vertical_bars':
+                        led_pattern = simple_led_patterns.generate_vertical_bars()
+                        what_to_see = "Alternating vertical columns (stripes)"
+                    elif pattern_name == 'horizontal_bars':
+                        led_pattern = simple_led_patterns.generate_horizontal_bars()
+                        what_to_see = "Alternating horizontal rows (stripes)"
+                    elif pattern_name == 'diagonal_gradient':
+                        led_pattern = simple_led_patterns.generate_diagonal_gradient()
+                        what_to_see = "Diagonal gradient from top-left to bottom-right"
+                    elif pattern_name == 'concentric':
+                        led_pattern = simple_led_patterns.generate_concentric_squares()
+                        what_to_see = "Concentric squares expanding from center"
+                    elif pattern_name == 'panel_corners':
+                        led_pattern = simple_led_patterns.generate_panel_corners()
+                        what_to_see = "Small bright markers in different corners of each panel"
+                    elif pattern_name.startswith('panel_'):
+                        # Individual panel tests
+                        panel_id = int(pattern_name.split('_')[1])
+                        led_pattern = self.led_tester.generate_individual_panel_test(panel_id)
+                        what_to_see = f"ONLY Panel {panel_id} lit (solid white), all others dark"
+                    elif pattern_name == 'numbers_1_8':
+                        # Numbers test - draw actual numbers on panels
+                        led_pattern = self._generate_numbers_pattern()
+                        what_to_see = "Numbers 1-8 displayed on each panel"
+                    elif pattern_name == 'hello_full':
+                        led_pattern = self._generate_hello_text('HELLO')
+                        what_to_see = "Text 'HELLO' across full display"
+                    elif pattern_name == 'hello_letter_h':
+                        led_pattern = self._generate_hello_text('H')
+                        what_to_see = "Single letter 'H' displayed"
+                    elif pattern_name == 'hello_letter_e':
+                        led_pattern = self._generate_hello_text('E')
+                        what_to_see = "Single letter 'E' displayed"
+                    elif pattern_name == 'hello_letter_l':
+                        led_pattern = self._generate_hello_text('L')
+                        what_to_see = "Single letter 'L' displayed"
+                    elif pattern_name == 'hello_letter_o':
+                        led_pattern = self._generate_hello_text('O')
+                        what_to_see = "Single letter 'O' displayed"
+                    elif pattern_name == 'human_center':
+                        led_pattern = self._generate_human_silhouette(position='center')
+                        what_to_see = "Human silhouette in center of display"
+                    elif pattern_name == 'human_left':
+                        led_pattern = self._generate_human_silhouette(position='left')
+                        what_to_see = "Human silhouette on left side"
+                    elif pattern_name == 'human_right':
+                        led_pattern = self._generate_human_silhouette(position='right')
+                        what_to_see = "Human silhouette on right side"
+                    elif pattern_name == 'human_wave':
+                        # Animated wave - use time for animation
+                        import math
+                        offset = int((time.time() * 2) % 32)
+                        led_pattern = self._generate_wave_pattern(offset)
+                        what_to_see = "Animated wave moving across display"
+                    else:
+                        led_pattern = np.zeros((64, 32), dtype=np.uint8)
+                        what_to_see = "Unknown pattern"
+                    
+                    # CRITICAL FIX: ESP32 firmware inverts X and Y coordinates in XY() function
+                    # We must flip the pattern to compensate
+                    # Flip Y axis (vertical), then X axis (horizontal)
+                    led_pattern_flipped = np.flip(np.flip(led_pattern, axis=0), axis=1)
+                    
+                    # Send GRAYSCALE to ESP32 (firmware expects single byte per pixel)
+                    packet = self.led.pack_led_packet(led_pattern_flipped)
+                    self.serial.send_led(packet)
+                    
+                    # Create RGB for DISPLAY ONLY (not for ESP32)
+                    led_rgb = np.stack([led_pattern, led_pattern, led_pattern], axis=2)
+                    
+                    # Create display frame
+                    h, w = frame.shape[:2]
+                    display_frame = np.zeros((h, w, 3), dtype=np.uint8)
+                    
+                    # Resize LED pattern for display (center it)
+                    led_display = cv2.resize(led_rgb, (w//2, h//2))
+                    y_offset = h//4
+                    x_offset = w//4
+                    display_frame[y_offset:y_offset+h//2, x_offset:x_offset+w//2] = led_display
+                    
+                    # Add instructions
+                    test_num = self.test_pattern_index
+                    total_tests = len(self.test_patterns)
+                    
+                    # Title
+                    cv2.putText(display_frame, "LED PANEL TEST MODE", (20, 40),
+                               cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 255), 3)
+                    
+                    # Category and test number
+                    cv2.putText(display_frame, f"[{category}] Test {test_num}/{total_tests-1}", (20, 80),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 200, 0), 2)
+                    
+                    # Description
+                    cv2.putText(display_frame, description, (20, 120),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                    
+                    # What you should see
+                    cv2.putText(display_frame, "WHAT YOU SHOULD SEE:", (20, 160),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                    cv2.putText(display_frame, f"  {what_to_see}", (20, 190),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 2)
+                    
+                    # Test category ranges
+                    cv2.putText(display_frame, "TEST CATEGORIES:", (20, h-180),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+                    cv2.putText(display_frame, "  0-4: STATIC baseline tests", (20, h-155),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+                    cv2.putText(display_frame, "  5-9: GEOMETRIC pattern tests", (20, h-135),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+                    cv2.putText(display_frame, "  10-17: INDIVIDUAL panel tests", (20, h-115),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+                    cv2.putText(display_frame, "  18: NUMBERS test", (20, h-95),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+                    cv2.putText(display_frame, f"  19-{total_tests-1}: HUMAN simulation tests", (20, h-75),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+                    
+                    # Controls
+                    cv2.putText(display_frame, "Press SPACE to change pattern | T to exit test mode",
+                               (20, h-40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+                
+                elif self.mode == "README":
                     display_frame = self.draw_readme(frame)
                 
                 elif self.mode == "MOTOR":
@@ -849,13 +1126,16 @@ class MirrorGUI:
                                 y = int(center_y + 120 * np.sin(angle * 0.7))
                                 cv2.circle(silhouette, (x, y), 15, (255, 255, 255), -1)
                         else:
-                            # DEBUG: Step 1
-                            # print("DEBUG: Pre-MediaPipe", end='\r') 
+                            # Human position tracking with MediaPipe
                             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                            pose_results = self.pose.process(frame_rgb)
                             
-                            # DEBUG: Step 2
-                            # print("DEBUG: Post-MediaPipe", end='\r')
+                            try:
+                                pose_results = self.pose.process(frame_rgb)
+                            except Exception as e:
+                                print(f"\nCRITICAL: MediaPipe processing error: {e}")
+                                traceback.print_exc()
+                                # Continue without crashing
+                                pose_results = None
 
                             # Check for human detection
                             human_detected = False
@@ -878,43 +1158,70 @@ class MirrorGUI:
                                 current_time = time.time()
                                 if current_time - self.last_serial_send_time > self.serial_min_interval:
                                     try:
-                                        # DEBUG: Step 3
-                                        # print("DEBUG: Sending Serial...", end='\r')
+                                        # Validate angles before packing
                                         valid_angles = []
                                         for a in angles:
-                                            if not np.isfinite(a): a = 90
-                                            valid_angles.append(int(a))
-                                            
+                                            if not np.isfinite(a): 
+                                                a = 90  # Default to center if invalid
+                                            a = max(0, min(180, int(a)))  # Clamp to valid range
+                                            valid_angles.append(a)
+                                        
+                                        # Pre-send validation
+                                        if len(valid_angles) != self.motor.num_servos:
+                                            print(f"⚠ Angle count mismatch: {len(valid_angles)} != {self.motor.num_servos}")
+                                            valid_angles = [90] * self.motor.num_servos
+                                        
                                         packet = self.motor.pack_servo_packet(valid_angles)
-                                        self.serial.send_servo(packet)
-                                        self.last_serial_send_time = current_time
-                                        # DEBUG: Step 4
-                                        # print("DEBUG: Serial Sent OK", end='\r')
+                                        
+                                        # Validate packet before sending
+                                        if packet is None or len(packet) == 0:
+                                            print("⚠ Invalid packet generated, skipping send")
+                                        else:
+                                            # DEFENSIVE: send_servo now handles all errors gracefully
+                                            success = self.serial.send_servo(packet)
+                                            if success:
+                                                self.last_serial_send_time = current_time
+                                    except ValueError as e:
+                                        print(f"⚠ Servo value error: {e}")
                                     except Exception as e:
-                                        print(f"Serial send skipped: {e}")
+                                        print(f"⚠ Serial send error: {e}")
+                                        traceback.print_exc()
 
                                 status = f"TRACKING HUMAN - Position: {human_x_position:.2f} ({target_angle:.1f}°)"
                                 
-                                # Create silhouette (Simplified for stability)
+                                # Create silhouette using segmentation mask
                                 silhouette = np.zeros_like(frame)
-                                # Segmentation disabled to prevent crash -> Use landmarks only
-                                if pose_results.pose_landmarks:
-                                    h, w = frame.shape[:2]
-                                    for landmark in pose_results.pose_landmarks.landmark:
-                                        x, y = int(landmark.x * w), int(landmark.y * h)
-                                        cv2.circle(silhouette, (x, y), 8, (255, 255, 255), -1)
+                                if pose_results.segmentation_mask is not None:
+                                    # Use segmentation mask for full body silhouette
+                                    mask = (pose_results.segmentation_mask > 0.5).astype(np.uint8) * 255
+                                    silhouette[:, :, 0] = mask
+                                    silhouette[:, :, 1] = mask
+                                    silhouette[:, :, 2] = mask
+                                else:
+                                    # Fallback: landmarks as dots if segmentation unavailable
+                                    if pose_results.pose_landmarks:
+                                        h, w = frame.shape[:2]
+                                        for landmark in pose_results.pose_landmarks.landmark:
+                                            x, y = int(landmark.x * w), int(landmark.y * h)
+                                            cv2.circle(silhouette, (x, y), 8, (255, 255, 255), -1)
                             else:
                                 status = "NO HUMAN DETECTED - Motors Stationary"
                                 silhouette = np.zeros_like(frame)
                         
                         # Create split-screen display: Left = Simulation/Silhouette, Right = Camera
+                        # IMPORTANT: Detection happens on FULL frame, display shows both sides
                         h, w = frame.shape[:2]
-                        display_frame = np.zeros_like(frame)
-                        display_frame[:, :w//2] = silhouette[:, :w//2]  # Left: silhouette/simulation
-                        display_frame[:, w//2:] = frame[:, w//2:]      # Right: camera feed
+                        half_w = w // 2
+                        
+                        # Resize both to half-width to fit side-by-side
+                        silhouette_half = cv2.resize(silhouette, (half_w, h))
+                        camera_half = cv2.resize(frame, (half_w, h))
+                        
+                        # Combine horizontally
+                        display_frame = np.hstack([silhouette_half, camera_half])
                         
                         # Add center divider line
-                        cv2.line(display_frame, (w//2, 0), (w//2, h), (0, 255, 255), 2)
+                        cv2.line(display_frame, (half_w, 0), (half_w, h), (0, 255, 255), 2)
                         
                         # Add labels
                         cv2.putText(display_frame, "COMPUTER SIMULATION", (20, 30), 
@@ -1160,7 +1467,23 @@ class MirrorGUI:
                 # Handle keyboard
                 key = cv2.waitKey(1) & 0xFF
                 
-                if key == ord('r') or key == ord('R'):
+                if key == ord(' '):  # SPACE key - cycle LED test patterns (forward)
+                    if self.mode == "LED_TEST" and hasattr(self, 'led_tester'):
+                        self.test_pattern_index = (self.test_pattern_index + 1) % len(self.test_patterns)
+                        print(f"→ Pattern: {self.test_patterns[self.test_pattern_index][1]}")
+                elif key == 83 or key == ord('d'):  # RIGHT ARROW or D - Next pattern
+                    if self.mode == "LED_TEST" and hasattr(self, 'led_tester'):
+                        self.test_pattern_index = (self.test_pattern_index + 1) % len(self.test_patterns)
+                        print(f"→ Next: {self.test_patterns[self.test_pattern_index][1]}")
+                elif key == 81 or key == ord('a'):  # LEFT ARROW or A - Previous pattern
+                    if self.mode == "LED_TEST" and hasattr(self, 'led_tester'):
+                        self.test_pattern_index = (self.test_pattern_index - 1) % len(self.test_patterns)
+                        print(f"<- Prev: {self.test_patterns[self.test_pattern_index][1]}")
+                elif key == ord('t') or key == ord('T'):
+                    self.mode = "LED_TEST"
+                    print("Mode: LED_TEST")
+                    self.log_event("mode_change", {"mode": self.mode})
+                elif key == ord('r') or key == ord('R'):
                     self.mode = "README"
                     print("Mode: README")
                     self.log_event("mode_change", {"mode": self.mode})
