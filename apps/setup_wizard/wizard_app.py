@@ -15,6 +15,7 @@ from .stages.stage_camera import CameraStage
 from .stages.stage_esp32 import ESP32Stage
 from .stages.stage_led_power import LEDPowerStage
 from .stages.stage_led_mapping import LEDMappingStage
+from .stages.stage_auto_calibrate import AutoCalibrationStage
 from .stages.stage_motors import MotorStage
 
 
@@ -43,7 +44,7 @@ class SetupWizard:
             CameraStage(),
             ESP32Stage(),
             LEDPowerStage(),
-            LEDMappingStage(),
+            AutoCalibrationStage(),  # Auto-calibration replaces manual mapping
             MotorStage()
         ]
     

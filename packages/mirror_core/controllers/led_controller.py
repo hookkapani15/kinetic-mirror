@@ -58,10 +58,43 @@ class LEDController:
         self.left_pin_panels = [1, 3, 5, 7]   # Panels on GPIO 5
         self.right_pin_panels = [2, 4, 6, 8]  # Panels on GPIO 18
         
+        # Auto-detected mapping (loaded from file if exists)
+        self.panel_mapping = None
+        self._load_calibration_mapping()
+        
         # Print current mode
         mode_names = {0: "RAW", 1: "ROW_SPLIT", 2: "COLUMN_SPLIT", 
-                      3: "COLUMN_SERPENTINE", 4: "FULL_CUSTOM"}
-        print(f"[LEDController] Mapping mode: {mode_names.get(mapping_mode, 'UNKNOWN')}")
+                      3: "COLUMN_SERPENTINE", 4: "FULL_CUSTOM", 5: "AUTO_CALIBRATED"}
+        if self.panel_mapping:
+            self.mapping_mode = 5  # Use auto-calibrated mode
+        print(f"[LEDController] Mapping mode: {mode_names.get(self.mapping_mode, 'UNKNOWN')}")
+    
+    def _load_calibration_mapping(self):
+        """Load auto-calibrated mapping from JSON file if it exists."""
+        import json
+        from pathlib import Path
+        
+        # Look for mapping file in data directory
+        possible_paths = [
+            Path(__file__).parents[3] / "data" / "led_mapping.json",
+            Path("data/led_mapping.json"),
+        ]
+        
+        for mapping_path in possible_paths:
+            if mapping_path.exists():
+                try:
+                    with open(mapping_path, 'r') as f:
+                        config = json.load(f)
+                    
+                    if "mapping" in config:
+                        self.panel_mapping = {
+                            int(k): v for k, v in config["mapping"].items()
+                        }
+                        print(f"[LEDController] Loaded calibration from {mapping_path}")
+                        print(f"[LEDController] Mapping: {self.panel_mapping}")
+                        return
+                except Exception as e:
+                    print(f"[LEDController] Failed to load mapping: {e}")
 
     def remap_for_hardware(self, frame):
         """
@@ -94,9 +127,40 @@ class LEDController:
             
         elif self.mapping_mode == self.MODE_FULL_CUSTOM:
             return self._remap_full_custom(frame)
+        
+        elif self.mapping_mode == 5 and self.panel_mapping:
+            # AUTO_CALIBRATED mode: use detected panel mapping
+            return self._remap_auto_calibrated(frame)
             
         else:
             return frame.copy()
+    
+    def _remap_auto_calibrated(self, frame):
+        """
+        Remap frame using auto-calibrated panel positions.
+        Uses self.panel_mapping: {logical_panel -> physical_position}
+        """
+        output = np.zeros_like(frame)
+        
+        for logical_panel in range(1, 9):
+            physical_pos = self.panel_mapping.get(logical_panel, logical_panel)
+            
+            # Source: where we READ from (logical layout)
+            src_row = (logical_panel - 1) // 2
+            src_col = (logical_panel - 1) % 2
+            src_y = src_row * 16
+            src_x = src_col * 16
+            
+            # Destination: where we WRITE to (physical layout)
+            dst_row = (physical_pos - 1) // 2
+            dst_col = (physical_pos - 1) % 2
+            dst_y = dst_row * 16
+            dst_x = dst_col * 16
+            
+            # Copy panel
+            output[dst_y:dst_y+16, dst_x:dst_x+16] = frame[src_y:src_y+16, src_x:src_x+16]
+        
+        return output
     
     def _remap_column_split(self, frame, serpentine=True):
         """
