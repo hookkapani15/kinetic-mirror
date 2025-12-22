@@ -10,6 +10,11 @@ import threading
 import time
 import queue
 import serial.tools.list_ports
+try:
+    from ..simulation.mock_serial import MockSerial, get_virtual_device_instance
+except ImportError:
+    MockSerial = None
+
 
 class SerialManager:
     def __init__(self, port='AUTO', baudrate=460800):
@@ -49,8 +54,29 @@ class SerialManager:
                     return False
                 self.port = esp32_port
 
-            self.ser = serial.Serial(self.port, self.baudrate, timeout=1)
-            time.sleep(2)  # Wait for connection
+            if self.port == 'SIMULATOR':
+                 if MockSerial is None:
+                     print("[ERROR] Simulation package not found")
+                     return False
+                 self.ser = MockSerial(self.port, self.baudrate)
+                 self.connected = True # Mock serial is always connected immediately
+                 print(f"[OK] Simulation started on {self.port}")
+                 return True
+
+            self.ser = serial.Serial(self.port, self.baudrate, timeout=1, write_timeout=0.1)
+            
+            # Force ESP32 Reset via DTR/RTS
+            self.ser.dtr = False
+            self.ser.rts = False
+            time.sleep(0.1)
+            self.ser.dtr = True  # Assert DTR to reset
+            self.ser.rts = True
+            time.sleep(0.1)
+            self.ser.dtr = False # Release
+            self.ser.rts = False
+            time.sleep(1)        # Wait for boot
+            
+            time.sleep(1)  # Wait for connection to stabilize
 
             # Test connection by waiting for READY
             ready_received = False
@@ -111,7 +137,8 @@ class SerialManager:
     def send_servo(self, packet):
         """Send servo packet to ESP32 with defensive error handling"""
         if not self.connected:
-            # Silently skip if not connected - don't crash the GUI
+            # Log warning so user knows packets are being dropped
+            print("[WARN] Servo packet dropped - serial not connected!")
             return False
             
         if not self.ser:
@@ -147,6 +174,13 @@ class SerialManager:
                 print("[WARN] Port closed between check and write")
                 self.connected = False
                 return False
+        except serial.SerialTimeoutException:
+            print("[WARN] Serial write timed out (buffer full?) - skipping packet")
+            try:
+                self.ser.reset_output_buffer()
+            except:
+                pass
+            return False
         except OSError as e:
             # Common for disconnected devices
             print(f"[ERROR] Serial device error: {e}")
@@ -161,9 +195,11 @@ class SerialManager:
     def send_led(self, packet):
         """Send LED packet to ESP32 with defensive error handling"""
         if not self.connected:
+            print("[WARN] LED packet dropped - serial not connected!")
             return False
             
         if not self.ser:
+            print("[WARN] LED packet dropped - serial port object is None!")
             self.connected = False
             return False
         
@@ -175,6 +211,9 @@ class SerialManager:
             self.ser.write(packet)
             self.last_error = None
             return True
+        except serial.SerialTimeoutException:
+            # Don't print for LED packets to avoid log spam, just skip
+            return False
         except OSError as e:
             print(f"[ERROR] LED device error: {e}")
             self.last_error = f"LED device error: {e}"
@@ -210,3 +249,13 @@ class SerialManager:
     def start(self):
         """Start the serial manager (for compatibility)"""
         pass
+
+    def get_simulation_instance(self):
+        """Get access to the underlying virtual ESP32 instance (if in simulation mode)"""
+        if self.port == 'SIMULATOR':
+            try:
+                from ..simulation.mock_serial import get_virtual_device_instance
+                return get_virtual_device_instance()
+            except ImportError:
+                return None
+        return None

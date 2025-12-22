@@ -1,55 +1,59 @@
-# Mirror Hybrid (Prod-ready layout)
+# Mirror Body Simulation
 
-Body/hand-tracking GUI with ESP32 firmware for LED matrix + servos.
+A full-body LED and motor simulation system for interactive art installations.
 
-## Folder map
-```
-apps/
-  gui/            GUI entrypoint (main.py), modes, startup wizard
-  cli/            Command-line helpers (debug_crash.py)
-packages/
-  mirror_core/    Core controllers and tests
-    controllers/  motor_controller.py, led_controller.py
-    io/           serial_manager.py
-    tests/        system_tests.py, automated/
-config/           PC defaults (config.json)
-firmware/
-  esp32/          ESP32 source (MirrorHybrid_ESP32.ino)
-  binaries/       Prebuilt bootloader/firmware/partitions
-logs/             Runtime and health logs
-docs/             (reserved for handoff docs)
-requirements.txt  Python deps
-```
+## Quick Start
 
-## Quick start (PC)
-```
+```bash
+# Install dependencies
 pip install -r requirements.txt
-python -m apps.gui.main --fast   # skip startup wizard
+
+# Run the simulation
+python main.py
 ```
-Controls: M motor, L LED, B both, R readme, C camera, D diagnostics, E emergency test, Q quit.
 
-## Config
-- PC config lives in `config/config.json` (auto-created on first run).
+## Features
 
-## Firmware upload
-Source: `firmware/esp32/MirrorHybrid_ESP32.ino`
-Prebuilt: `firmware/binaries/`
+- **LED Body Tracking**: Full human silhouette displayed on 16x16 LED panels.
+- **Motor Wave Effect**: 64 motors respond to body position.
+- **Real-time AI Vision**: MediaPipe-powered pose and segmentation.
+- **Simulation Mode**: Test without hardware using built-in visualizer.
 
-USB (recommended):
-1) Plug ESP32 (note COM port, e.g., COM3).
-2) Arduino IDE: open `MirrorHybrid_ESP32.ino`, select ESP32 DevKit board + port, Upload.
-   or PlatformIO CLI: `pio run -d firmware/esp32 -t upload --upload-port COM3`
+## Controls
 
-OTA (if prior OTA firmware is running on Wi‑Fi):
-1) Ensure ESP32 is on the same network.
-2) Upload via Arduino IDE network port (`MirrorHybrid-ESP32`) or Arduino/PIO OTA command.
+| Key | Action |
+|-----|--------|
+| `q` | Quit |
+| `m` | Reset / Menu |
 
-## Packet formats (PC → ESP32)
-- LED: `[0xAA, 0xBB, 0x01, 2048 bytes brightness]`
-- Servo: `[0xAA, 0xBB, 0x02, 6 × uint16 big-endian (0–1000)]`
+## Modes
 
-## Handoff notes
-- Firmware binaries: `firmware/binaries`; sources: `firmware/esp32`.
-- Logs: `logs/`; GUI health/diagnostics write here.
-- Core code: `packages/mirror_core`; GUI: `apps/gui/main.py`; helpers: `apps/cli/`.
-- Tests: `packages/mirror_core/tests/`.
+- **LED Only**: Display body silhouette (Default).
+- **Motor Only**: Wave effect from body center.
+- **Both**: Full system simulation.
+
+## Project Structure
+
+```
+mirror-prod/
+├── main.py              # Entry point
+├── led_control_gui.py   # Main application
+├── apps/                # Application modules
+│   ├── gui/             # GUI components
+│   └── simulation/      # Simulation visualizer
+├── packages/            # Core libraries
+│   └── mirror_core/     # Controllers, IO, Simulation
+├── firmware/            # ESP32 firmware
+├── tools/               # Utilities & debug scripts
+└── tests/               # Test suites
+```
+
+## Hardware
+
+- **ESP32-S3** with dual GPIO pins for WS2812B LEDs.
+- **64 Servo Motors** for mechanical movement.
+- **8x 16x16 LED Panels** (2048 LEDs total).
+
+## License
+
+MIT

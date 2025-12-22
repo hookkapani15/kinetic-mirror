@@ -134,7 +134,7 @@ HEALTH_LOG = LOG_DIR / "health_log.jsonl"
 
 class MirrorGUI:
     def __init__(self):
-        self.mode = "LED_TEST"  # Start in LED test mode to verify panel placement
+        self.mode = "README"  # Start in README mode for main menu
         self.running = True
         self.camera_index = config['camera_index']
         self.available_cameras = []
@@ -144,7 +144,9 @@ class MirrorGUI:
         
         # Rate limiting for serial
         self.last_serial_send_time = 0
-        self.serial_min_interval = 0.05  # Max 20 packets per second
+        self.serial_min_interval = 0.066  # Safer 15 packets per second (prevents freeze)
+        self.last_led_send_time = 0
+        self.led_min_interval = 0.055     # Approx 18 FPS for LED packets (bandwidth limit)
         
         # Initialize motor controller (32 servos across 2 PCA9685 boards)
         self.motor = MotorController(num_servos=32)
@@ -1111,7 +1113,7 @@ class MirrorGUI:
                         # MOTOR MODE: Human position tracking
                         if not MEDIAPIPE_AVAILABLE:
                             # Demo mode - simulate motor movement based on human position
-                            angles = [90 + 20 * np.sin(time.time() * 2 + i * 0.5) for i in range(6)]  # Simulate movement
+                            angles = [90 + 20 * np.sin(time.time() * 2 + i * 0.5) for i in range(32)]  # Simulate movement
                             packet = self.motor.pack_servo_packet(angles)
                             self.serial.send_servo(packet)
                             status = "DEMO MODE - Simulated Tracking"
@@ -1308,8 +1310,10 @@ class MirrorGUI:
                                         x, y = int(landmark.x * w), int(landmark.y * h)
                                         cv2.circle(silhouette, (x, y), 8, (255, 255, 255), -1)
                         
-                        packet = self.led.pack_led_packet(led_frame)
-                        self.serial.send_led(packet)
+                        if time.time() - self.last_led_send_time > self.led_min_interval:
+                            packet = self.led.pack_led_packet(led_frame)
+                            if self.serial.send_led(packet):
+                                self.last_led_send_time = time.time()
                         
                         # Create split-screen display: Left = Simulation/Silhouette, Right = Camera
                         h, w = frame.shape[:2]
@@ -1415,8 +1419,10 @@ class MirrorGUI:
                                     x, y = int(landmark.x * w), int(landmark.y * h)
                                     cv2.circle(silhouette, (x, y), 8, (255, 255, 255), -1)
                     
-                    led_packet = self.led.pack_led_packet(led_frame)
-                    self.serial.send_led(led_packet)
+                    if time.time() - self.last_led_send_time > self.led_min_interval:
+                        led_packet = self.led.pack_led_packet(led_frame)
+                        if self.serial.send_led(led_packet):
+                            self.last_led_send_time = time.time()
                     
                     # Create split-screen display: Left = Simulation/Silhouette, Right = Camera
                     h, w = frame.shape[:2]
@@ -1502,6 +1508,14 @@ class MirrorGUI:
                 elif key == ord('c') or key == ord('C'):
                     self.switch_camera()
                     self.log_event("camera_switch", {"camera": self.camera_index})
+                elif key == ord('k') or key == ord('K'):
+                    print("Attempting to reconnect serial...")
+                    self.serial.close()
+                    time.sleep(1)
+                    if self.serial.connect():
+                        print("Reconnect successful!")
+                    else:
+                        print("Reconnect failed.")
                 elif key == ord('d') or key == ord('D'):
                     self.safe_run_diagnostics()
                 elif key == ord('e') or key == ord('E'):

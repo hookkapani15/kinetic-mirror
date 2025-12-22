@@ -216,15 +216,15 @@ void processServoPacket() {
 // ==================== SETUP ====================
 void setup() {
   // CRITICAL: Disable watchdog timer to prevent crash during LED/Servo
-  // processing
+  // processing. NOTE: disableCore1WDT() crashes on ESP32-S3 with USB CDC mode!
   disableCore0WDT();
-  disableCore1WDT();
+  // disableCore1WDT();  // DISABLED - causes crash on ESP32-S3 USB mode
 
   Serial.begin(BAUD_RATE);
   Serial.setTimeout(1);
   Serial.println("\n=== MIRROR HYBRID - ESP32 ===");
   Serial.println("Body + Hand Tracking v1.0");
-  Serial.println("Watchdog timers DISABLED for stability");
+  Serial.println("Watchdog timer Core0 disabled for stability");
 
   // LEDs
   Serial.println("Init LEDs...");

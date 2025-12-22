@@ -185,23 +185,44 @@ class LEDController:
         """
         led_frame = np.zeros((self.height, self.width, 3), dtype=np.uint8)
 
-        if pose_results and pose_results.pose_landmarks:
-            if seg_mask is not None:
-                mask_resized = cv2.resize(seg_mask, (self.width, self.height))
-                binary_mask = (mask_resized > 0.5).astype(np.uint8) * 255
-                led_frame[:, :, 0] = binary_mask
-                led_frame[:, :, 1] = binary_mask
-                led_frame[:, :, 2] = binary_mask
-            else:
-                h, w = self.height, self.width
-                for landmark in pose_results.pose_landmarks.landmark:
-                    if landmark.visibility > 0.8:
-                        x = int(landmark.x * w)
-                        y = int(landmark.y * h)
-                        if 0 <= x < w and 0 <= y < h:
-                            cv2.circle(led_frame, (x, y), 2, (255, 255, 255), -1)
-
+        try:
+            if pose_results and pose_results.pose_landmarks:
+                # Use segmentation mask if available and valid
+                if seg_mask is not None and hasattr(seg_mask, 'shape') and len(seg_mask.shape) >= 2:
+                    try:
+                        # Resize with explicit type handling
+                        mask_resized = cv2.resize(seg_mask, (self.width, self.height), interpolation=cv2.INTER_NEAREST)
+                        binary_mask = (mask_resized > 0.5).astype(np.uint8) * 255
+                        led_frame[:, :, 0] = binary_mask
+                        led_frame[:, :, 1] = binary_mask
+                        led_frame[:, :, 2] = binary_mask
+                    except Exception as e:
+                        print(f"[LEDController] Mask resize failed: {e}")
+                        # Fallback to landmarks
+                        self._render_landmarks(led_frame, pose_results)
+                else:
+                    # Fallback: draw pose landmarks as silhouette
+                    self._render_landmarks(led_frame, pose_results)
+        except Exception as e:
+            print(f"[LEDController] render_frame error: {e}")
+            
         return led_frame
+
+    def _render_landmarks(self, led_frame, pose_results):
+        """Helper to render landmarks when mask fails"""
+        h, w = self.height, self.width
+        for landmark in pose_results.pose_landmarks.landmark:
+            if landmark.visibility > 0.6:  # Lowered threshold slightly
+                x = int(landmark.x * w)
+                y = int(landmark.y * h)
+                # Expand to 3x3 dot for visibility
+                if 0 <= x < w and 0 <= y < h:
+                    led_frame[y, x] = [255, 255, 255]
+                    # Draw minimal cross pattern
+                    if x > 0: led_frame[y, x-1] = [100, 100, 100]
+                    if x < w-1: led_frame[y, x+1] = [100, 100, 100]
+                    if y > 0: led_frame[y-1, x] = [100, 100, 100]
+                    if y < h-1: led_frame[y+1, x] = [100, 100, 100]
 
     def pack_led_packet(self, led_frame):
         """

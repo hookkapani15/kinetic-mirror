@@ -9,7 +9,7 @@ import numpy as np
 import struct
 
 class MotorController:
-    def __init__(self, num_servos=6, angle_min=0, angle_max=180):
+    def __init__(self, num_servos=64, angle_min=0, angle_max=180):
         self.num_servos = num_servos
         self.angle_min = angle_min
         self.angle_max = angle_max
