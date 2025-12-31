@@ -75,18 +75,13 @@ class LEDControlApp:
         self.root.after(1000, self.auto_start)
     
     def auto_start(self):
-        """Auto-connect to Simulator and start tracking"""
+        """Auto-Start"""
         try:
-            # 1. Select Simulator
             if "SIMULATOR" in self.port_combo['values']:
                 self.port_combo.set("SIMULATOR")
                 self.connect()
-                
-            # 2. Start Tracking (Camera 0)
-            if self.available_cameras:
-                self.cam_combo.set(self.available_cameras[0])
-                self.toggle_tracking()
-        except:
+        except Exception as e:
+            print(f"Auto-start error: {e}")
             pass
 
     def detect_cameras(self):
