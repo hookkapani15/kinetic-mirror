@@ -14,6 +14,8 @@ import io
 
 import cv2
 import mediapipe as mp
+from mediapipe.tasks import python as mp_python
+from mediapipe.tasks.python import vision as mp_vision
 import time
 from packages.mirror_core.controllers.led_controller import LEDController
 from packages.mirror_core.controllers.motor_controller import MotorController
@@ -36,7 +38,8 @@ class LEDControlApp:
         # Tracking State
         self.tracking_active = False
         self.cap = None
-        self.pose = None
+        self.pose_landmarker = None
+        self.bg_subtractor = cv2.createBackgroundSubtractorMOG2(history=500, varThreshold=16, detectShadows=False)
         
         # Simulation Mode
         self.sim_modes = ["LED Only", "Motor Only", "Both"]
@@ -85,15 +88,42 @@ class LEDControlApp:
             pass
 
     def detect_cameras(self):
-        """Detect available cameras"""
+        """Detect available cameras with detailed logging"""
         available = []
-        for i in range(5):
+        print(f"[Camera Detection] Scanning for cameras...")
+        
+        for i in range(10):  # Check more indices
             try:
+                print(f"[Camera Detection] Trying camera index {i}...")
                 cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)
+                
+                # Wait a bit for camera to initialize
+                time.sleep(0.1)
+                
                 if cap.isOpened():
-                    available.append(i)
+                    # Try to read a frame to confirm it's working
+                    ret, frame = cap.read()
+                    if ret and frame is not None:
+                        available.append(i)
+                        print(f"[Camera Detection] ✓ Camera {i} is available and working")
+                    else:
+                        print(f"[Camera Detection] ✗ Camera {i} opened but can't read frames")
                     cap.release()
-            except: pass
+                else:
+                    print(f"[Camera Detection] ✗ Camera {i} not available")
+            except Exception as e:
+                print(f"[Camera Detection] ✗ Camera {i} error: {e}")
+        
+        print(f"[Camera Detection] Found {len(available)} working cameras: {available}")
+        
+        if not available:
+            print("[Camera Detection] WARNING: No cameras detected!")
+            print("[Camera Detection] Possible issues:")
+            print("  - Camera is being used by another application")
+            print("  - Camera permissions not granted")
+            print("  - No camera connected")
+            print("  - Camera drivers not installed")
+        
         return available
 
     def create_widgets(self):
@@ -140,7 +170,11 @@ class LEDControlApp:
         self.cam_combo = ttk.Combobox(controls, values=self.available_cameras, width=5)
         if self.available_cameras:
             self.cam_combo.set(self.available_cameras[0])
+        else:
+            self.cam_combo.set("No camera")
         self.cam_combo.pack(side=tk.LEFT, padx=5)
+        
+        ttk.Button(controls, text="Refresh Cameras", command=self.refresh_cameras).pack(side=tk.LEFT, padx=5)
         
         self.track_btn = ttk.Button(controls, text="Start Tracking", command=self.toggle_tracking)
         self.track_btn.pack(side=tk.LEFT, padx=10)
@@ -177,6 +211,19 @@ class LEDControlApp:
             self.log_text.insert(tk.END, message + "\n")
             self.log_text.see(tk.END)
         except: pass
+    
+    def refresh_cameras(self):
+        """Refresh the list of available cameras"""
+        self.log("Refreshing camera list...")
+        self.available_cameras = self.detect_cameras()
+        self.cam_combo['values'] = self.available_cameras
+        
+        if self.available_cameras:
+            self.cam_combo.set(self.available_cameras[0])
+            self.log(f"Found {len(self.available_cameras)} camera(s): {self.available_cameras}")
+        else:
+            self.cam_combo.set("No camera")
+            self.log("No cameras found! Check connections and permissions.")
     
     def detect_ports(self):
         """Detect available serial ports"""
@@ -315,27 +362,85 @@ class LEDControlApp:
                 messagebox.showerror("Error", "Connect to Simulator first")
                 return
             
+            # Get camera index
             try:
                 cam_idx = int(self.cam_combo.get())
             except:
-                cam_idx = 0
+                if self.available_cameras:
+                    cam_idx = self.available_cameras[0]
+                else:
+                    messagebox.showerror("Error", "No cameras detected!\n\nPlease check:\n- Camera is not being used by another app\n- Camera permissions are granted\n- Camera is properly connected")
+                    return
             
             self.log(f"Starting tracking on camera {cam_idx}...")
             
-            # Init MediaPipe with Segmentation (LITE MODEL for Speed)
-            mp_pose = mp.solutions.pose
+            # Init MediaPipe Pose Landmarker (New API)
+            try:
+                import urllib.request
+                import os
+                from pathlib import Path
+                
+                # Download model if not exists
+                model_path = Path("data/pose_landmarker_lite.task")
+                model_path.parent.mkdir(exist_ok=True)
+                
+                if not model_path.exists():
+                    self.log("Downloading pose model (one-time, ~10MB)...")
+                    model_url = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task"
+                    urllib.request.urlretrieve(model_url, model_path)
+                    self.log("✓ Model downloaded")
+                
+                base_options = mp_python.BaseOptions(model_asset_path=str(model_path))
+                options = mp_vision.PoseLandmarkerOptions(
+                    base_options=base_options,
+                    running_mode=mp_vision.RunningMode.VIDEO,
+                    min_pose_detection_confidence=0.5,
+                    min_pose_presence_confidence=0.5,
+                    min_tracking_confidence=0.5
+                )
+                self.pose_landmarker = mp_vision.PoseLandmarker.create_from_options(options)
+                self.log("✓ MediaPipe Pose initialized")
+            except Exception as e:
+                self.log(f"MediaPipe error: {e}")
+                messagebox.showerror("Error", f"Failed to initialize MediaPipe: {e}\n\nFalling back to simple tracking...")
+                # Don't return - continue with basic tracking
+                self.pose_landmarker = None
             
-            self.pose = mp_pose.Pose(
-                min_detection_confidence=0.5, 
-                min_tracking_confidence=0.5,
-                model_complexity=0, # Lite model for CPU optimization
-                enable_segmentation=True
-            )
+            # Try multiple times to open camera
+            self.log(f"Opening camera {cam_idx}...")
+            self.cap = None
             
-            self.cap = cv2.VideoCapture(cam_idx, cv2.CAP_DSHOW)
+            for attempt in range(3):
+                try:
+                    self.cap = cv2.VideoCapture(cam_idx, cv2.CAP_DSHOW)
+                    time.sleep(0.2)  # Give camera time to initialize
+                    
+                    if self.cap.isOpened():
+                        # Verify we can read frames
+                        ret, frame = self.cap.read()
+                        if ret and frame is not None:
+                            self.log(f"✓ Camera {cam_idx} opened successfully!")
+                            break
+                        else:
+                            self.log(f"Camera {cam_idx} opened but can't read frames (attempt {attempt+1}/3)")
+                            self.cap.release()
+                            self.cap = None
+                    else:
+                        self.log(f"Failed to open camera {cam_idx} (attempt {attempt+1}/3)")
+                        
+                except Exception as e:
+                    self.log(f"Camera error (attempt {attempt+1}/3): {e}")
+                    
+                time.sleep(0.3)
             
-            if not self.cap.isOpened():
-                self.log("Error: Could not open camera")
+            if not self.cap or not self.cap.isOpened():
+                error_msg = f"Could not open camera {cam_idx}\n\nTroubleshooting:\n"
+                error_msg += "1. Close other apps using the camera\n"
+                error_msg += "2. Try a different camera index\n"
+                error_msg += "3. Check camera permissions\n"
+                error_msg += "4. Reconnect the camera"
+                messagebox.showerror("Camera Error", error_msg)
+                self.log("ERROR: Could not open camera")
                 return
 
             self.tracking_active = True
@@ -345,101 +450,113 @@ class LEDControlApp:
             threading.Thread(target=self.tracking_loop, daemon=True).start()
 
     def tracking_loop(self):
+        frame_count = 0
         while self.tracking_active and self.cap.isOpened():
             success, image = self.cap.read()
             if not success:
                 continue
             
+            frame_count += 1
+            
             # Flip for mirror view
             image = cv2.flip(image, 1)
-            image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            
-            # Process Pose (including Segmentation)
-            # Resize image for faster inference if valid/necessary
-            # small_frame = cv2.resize(image_rgb, (320, 240)) # Optional optimization
-            results = self.pose.process(image_rgb)
+            h, w, _ = image.shape
             
             motor_angles = [90] * self.motor_controller.num_servos
             led_frame = np.zeros((64, 32, 3), dtype=np.uint8) # Default Black
             
             # --- VISION FEED VISUALIZATION ---
-            # Used to debug what the system sees on the screen
             debug_frame = image.copy()
-            h, w, _ = debug_frame.shape
             
             # Info Text Setup
             cv2.putText(debug_frame, f"MODE: {self.current_mode.upper()}", (10, 30), 
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
             
-            # --- MOTOR LOGIC ---
-            if self.current_mode in ["Motor Only", "Both"] and results.pose_landmarks:
-                # 1. MOTOR LOGIC: Body Center X -> Wave Direction
-                # Find center of mass (avg of hips or shoulders)
-                landmarks = results.pose_landmarks.landmark
+            # Process Pose with new MediaPipe API
+            pose_detected = False
+            try:
+                if self.pose_landmarker:
+                    # Convert to RGB for MediaPipe
+                    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=image_rgb)
+                    
+                    # Get timestamp in milliseconds
+                    timestamp_ms = int(frame_count * 33)  # Assuming ~30fps
+                    
+                    # Detect pose
+                    detection_result = self.pose_landmarker.detect_for_video(mp_image, timestamp_ms)
+                else:
+                    detection_result = None
                 
-                # Get average X of hips (more stable than shoulders)
-                # 23=left_hip, 24=right_hip
-                x_avg = (landmarks[23].x + landmarks[24].x) / 2
-                
-                # Draw VERTICAL LINE for Motor Tracking
-                motor_x = int(x_avg * w)
-                cv2.line(debug_frame, (motor_x, 60), (motor_x, h), (0, 0, 255), 2)
-                
-                # Text Explanation
-                info_text = f"MOTORS: Following Body X ({x_avg:.2f})"
-                cv2.putText(debug_frame, info_text, (10, 60), 
+                if detection_result and detection_result.pose_landmarks:
+                    pose_detected = True
+                    landmarks = detection_result.pose_landmarks[0]  # Get first person
+                    
+                    # --- MOTOR LOGIC ---
+                    if self.current_mode in ["Motor Only", "Both"]:
+                        # Get hip center (landmarks 23=left_hip, 24=right_hip)
+                        if len(landmarks) > 24:
+                            left_hip = landmarks[23]
+                            right_hip = landmarks[24]
+                            x_avg = (left_hip.x + right_hip.x) / 2
+                            
+                            # Draw VERTICAL LINE for Motor Tracking
+                            motor_x = int(x_avg * w)
+                            cv2.line(debug_frame, (motor_x, 60), (motor_x, h), (0, 0, 255), 2)
+                            
+                            info_text = f"MOTORS: Following Body X ({x_avg:.2f})"
+                            cv2.putText(debug_frame, info_text, (10, 60), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+                            
+                            # Motor angles
+                            center_idx = int(x_avg * self.motor_controller.num_servos)
+                            for i in range(self.motor_controller.num_servos):
+                                dist = abs(i - center_idx)
+                                strength = max(0, 1.0 - (dist / 10.0))
+                                angle = 90 + (strength * 90)
+                                motor_angles[i] = angle
+                        else:
+                            cv2.putText(debug_frame, "MOTORS: Waiting for Body...", (10, 60), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100, 100, 100), 1)
+                    
+                    # --- LED LOGIC (using background subtraction for silhouette) ---
+                    if self.current_mode in ["LED Only", "Both"]:
+                        # Create body mask using background subtractor
+                        fg_mask = self.bg_subtractor.apply(image)
+                        
+                        # Clean up mask
+                        kernel = np.ones((5,5), np.uint8)
+                        fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, kernel)
+                        fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, kernel)
+                        
+                        # Resize for LED matrix
+                        mask_resized = cv2.resize(fg_mask, (32, 64))
+                        led_pattern = (mask_resized > 127).astype(np.uint8) * 255
+                        led_frame[:, :, 1] = led_pattern  # Green channel
+                        
+                        # Visualization overlay
+                        green_overlay = np.zeros_like(debug_frame)
+                        green_overlay[:, :, 1] = fg_mask
+                        cv2.addWeighted(debug_frame, 1.0, green_overlay, 0.3, 0, debug_frame)
+                        
+                        cv2.putText(debug_frame, "LEDS: Body Silhouette Active", (10, 110), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                else:
+                    cv2.putText(debug_frame, "No person detected", (10, 60), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100, 100, 100), 1)
+                    
+            except Exception as e:
+                cv2.putText(debug_frame, f"Error: {str(e)[:40]}", (10, 60), 
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
-                
-                # Logic: Motors "look" at this X.
-                center_idx = int(x_avg * self.motor_controller.num_servos)
-                
-                for i in range(self.motor_controller.num_servos):
-                    # Calculate distance from center (0-64)
-                    dist = abs(i - center_idx)
-                    
-                    # Motor strength based on proximity to body center
-                    # Close = Active (180), Far = Inactive (0-90)
-                    strength = max(0, 1.0 - (dist / 10.0)) # Width of wave
-                    
-                    angle = 90 + (strength * 90) # 90..180
-                    motor_angles[i] = angle
-            else:
-                 cv2.putText(debug_frame, "MOTORS: Waiting for Body...", (10, 60), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100, 100, 100), 1)
-            
-            # --- LED LOGIC ---
-            if self.current_mode in ["LED Only", "Both"] and results.segmentation_mask is not None:
-                # 2. LED LOGIC: Full "Fat" Silhouette
-                # Use segmentation mask directly
-                
-                # --- LED MAPPING ---
-                mask_resized = cv2.resize(results.segmentation_mask, (32, 64))
-                led_pattern = (mask_resized > 0.2).astype(np.uint8) * 255
-                led_frame[:, :, 1] = led_pattern # Green Channel
-                
-                # --- VISUALIZATION OVERLAY ---
-                green_overlay = np.zeros_like(debug_frame)
-                green_overlay[:, :, 1] = (results.segmentation_mask * 255).astype(np.uint8)
-                
-                # Add weighted overlay
-                cv2.addWeighted(debug_frame, 1.0, green_overlay, 0.5, 0, debug_frame)
-                
-                # Text Explanation
-                cv2.putText(debug_frame, "LEDS: Copying Body Silhouette", (10, 110), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-            else:
-                 cv2.putText(debug_frame, "LEDS: No Silhouette", (10, 110), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100, 100, 100), 1)
             
             # --- SEND PACKETS ---
             if self.current_mode in ["Motor Only", "Both"]:
-                 self.send_motor_packet(motor_angles)
+                self.send_motor_packet(motor_angles)
                  
             if self.current_mode in ["LED Only", "Both"]:
-                 self.send_led_packet(led_frame)
+                self.send_led_packet(led_frame)
             
             # --- UPDATE UI PREVIEW ---
-            # Resize for UI
             preview = cv2.resize(debug_frame, (640, 480))
             preview_rgb = cv2.cvtColor(preview, cv2.COLOR_BGR2RGB)
             img = Image.fromarray(preview_rgb)
