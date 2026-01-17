@@ -40,7 +40,7 @@ class LEDControlApp:
         
         # Simulation Mode
         self.sim_modes = ["LED Only", "Motor Only", "Both"]
-        self.current_mode = "LED Only"
+        self.current_mode = "Motor Only"  # Default to motors only for this system
         
         # Camera
         self.available_cameras = self.detect_cameras()
@@ -48,7 +48,7 @@ class LEDControlApp:
         
         # Controllers
         self.led_controller = LEDController(width=32, height=64)
-        self.motor_controller = MotorController(num_servos=64)
+        self.motor_controller = MotorController(num_servos=32)  # Match firmware (32 servos)
         
         # UI Image
         self.current_image = None
@@ -359,7 +359,7 @@ class LEDControlApp:
             # small_frame = cv2.resize(image_rgb, (320, 240)) # Optional optimization
             results = self.pose.process(image_rgb)
             
-            motor_angles = [90] * 64
+            motor_angles = [90] * self.motor_controller.num_servos
             led_frame = np.zeros((64, 32, 3), dtype=np.uint8) # Default Black
             
             # --- VISION FEED VISUALIZATION ---
@@ -391,9 +391,9 @@ class LEDControlApp:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
                 
                 # Logic: Motors "look" at this X.
-                center_idx = int(x_avg * 64)
+                center_idx = int(x_avg * self.motor_controller.num_servos)
                 
-                for i in range(64):
+                for i in range(self.motor_controller.num_servos):
                     # Calculate distance from center (0-64)
                     dist = abs(i - center_idx)
                     
