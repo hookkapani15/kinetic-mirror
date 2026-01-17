@@ -148,6 +148,7 @@ class MirrorGUI:
         self.led_only = led_only
         self.mode = "README"  # Start in README mode for main menu
         self.running = True
+        self.restart_requested = False
         self.camera_index = config['camera_index']
         self.available_cameras = []
         self.session_id = int(time.time())
@@ -971,8 +972,10 @@ class MirrorGUI:
                 "KEYBOARD CONTROLS:",
                 "",
                 "R - README (this screen)",
+                "r - Relaunch GUI",
                 "L - LED Mode (display only)",
                 "T - LED TEST Mode",
+                "m - Back to README",
                 "C - Switch Camera",
                 "D - Run DIAGNOSTICS",
                 "Q - QUIT",
@@ -989,7 +992,9 @@ class MirrorGUI:
                 "KEYBOARD CONTROLS:",
                 "",
                 "R - README (this screen)",
+                "r - Relaunch GUI",
                 "M - MOTOR Mode (servos only)",
+                "m - Back to README",
                 "L - LED Mode (display only)",
                 "B - BOTH Mode (servos + LEDs)",
                 "T - LED TEST Mode",
@@ -1034,10 +1039,12 @@ class MirrorGUI:
         if self.led_only:
             print("LED-only build: motor controls hidden")
             print("Press R for README, L for LEDs, T for LED tests")
-            print("Press D for Diagnostics, C to switch camera, Q to quit\n")
+            print("Press D for Diagnostics, C to switch camera, Q to quit")
+            print("Press m to return to README, r to relaunch GUI\n")
         else:
             print("Press R for README, M for Motors, L for LEDs, B for Both")
-            print("Press D for Diagnostics, C to switch camera, Q to quit\n")
+            print("Press D for Diagnostics, C to switch camera, Q to quit")
+            print("Press m to return to README, r to relaunch GUI\n")
         
         cv2.namedWindow("Mirror Body Animations", cv2.WINDOW_NORMAL)
         cv2.setWindowProperty("Mirror Body Animations", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
@@ -1634,17 +1641,27 @@ class MirrorGUI:
                     self.mode = "LED_TEST"
                     print("Mode: LED_TEST")
                     self.log_event("mode_change", {"mode": self.mode})
-                elif key == ord('r') or key == ord('R'):
+                elif key == ord('m'):
                     self.mode = "README"
-                    print("Mode: README")
+                    print("Mode: README (main menu)")
                     self.log_event("mode_change", {"mode": self.mode})
-                elif key == ord('m') or key == ord('M'):
+                    continue
+                elif key == ord('M'):
                     if self.led_only:
                         print("⚠ Motor mode disabled in LED-only GUI")
                     else:
                         self.mode = "MOTOR"
                         print("Mode: MOTOR (servos only)")
                         self.log_event("mode_change", {"mode": self.mode})
+                elif key == ord('r'):
+                    print("↻ Relaunching GUI (user request)...")
+                    self.restart_requested = True
+                    self.running = False
+                    continue
+                elif key == ord('R'):
+                    self.mode = "README"
+                    print("Mode: README (this screen)")
+                    self.log_event("mode_change", {"mode": self.mode})
                 elif key == ord('l') or key == ord('L'):
                     self.mode = "LED"
                     print("Mode: LED (display only)")
@@ -1705,6 +1722,9 @@ if __name__ == "__main__":
     try:
         gui = MirrorGUI(led_only=LED_ONLY_MODE)
         gui.run()
+        if gui.restart_requested:
+            print("↻ Restarting GUI...")
+            os.execl(sys.executable, sys.executable, *sys.argv)
     except KeyboardInterrupt:
         print("\n✓ Interrupted by user")
     except Exception as e:
