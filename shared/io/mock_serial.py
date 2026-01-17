@@ -5,7 +5,11 @@ Mimics serial.Serial for the Virtual ESP32
 """
 
 import time
-from .virtual_esp32 import VirtualESP32
+import sys
+import os
+# Add parent directory to path to import from simulation
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../')))
+from simulation.virtual_esp32 import VirtualESP32
 
 # Global singleton to share state between the "serial port" and the visualizer
 # This is necessary because SerialManager instantiates the class, but the Visualizer needs to peek inside.

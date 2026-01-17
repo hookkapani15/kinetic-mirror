@@ -121,7 +121,7 @@ class MotorControlApp:
         controls.pack(fill=tk.X)
         
         ttk.Label(controls, text="Camera:").pack(side=tk.LEFT, padx=5)
-        self.cam_combo = ttk.Combobox(controls, values=self.available_cameras, width=5)
+        self.cam_combo = ttk.Combobox(controls, values=self.available_cameras, width=5, state="readonly")
         if self.available_cameras:
             self.cam_combo.set(self.available_cameras[0])
         self.cam_combo.pack(side=tk.LEFT, padx=5)
@@ -132,7 +132,7 @@ class MotorControlApp:
         ttk.Label(controls, text="(q=Quit, m=Reset)").pack(side=tk.LEFT, padx=5)
         
         # Video Preview
-        self.video_label = ttk.Label(track_frame)
+        self.video_label = ttk.Label(track_frame, text="Video preview will appear here when tracking starts")
         self.video_label.pack(fill=tk.BOTH, expand=True, pady=10)
         
         # Log Frame
@@ -206,13 +206,23 @@ class MotorControlApp:
     
     def toggle_tracking(self):
         if self.tracking_active:
+            # Stop tracking
             self.tracking_active = False
-            self.track_btn.config(text="Start Tracking")
+            self.track_btn.config(text="Start Tracking", state="normal")
+            self.cam_combo.config(state="readonly")  # Re-enable camera selection
             if self.cap:
                 self.cap.release()
                 self.cap = None
+            if self.pose:
+                self.pose.close()
+                self.pose = None
             self.log("Tracking Stopped")
         else:
+            # Start tracking - check if already active
+            if self.tracking_active:
+                self.log("Tracking already active - please stop first")
+                return
+                
             if not self.serial_port or not self.serial_port.is_open:
                 messagebox.showerror("Error", "Please connect to ESP32 first")
                 return
@@ -223,6 +233,12 @@ class MotorControlApp:
                 cam_idx = 0
             
             self.log(f"Starting motor tracking on camera {cam_idx}...")
+            
+            # Stop any existing tracking first
+            if self.cap:
+                self.cap.release()
+            if self.pose:
+                self.pose.close()
             
             # Init MediaPipe Pose
             mp_pose = mp.solutions.pose
@@ -235,21 +251,28 @@ class MotorControlApp:
             self.cap = cv2.VideoCapture(cam_idx, cv2.CAP_DSHOW)
             
             if not self.cap.isOpened():
-                self.log("Error: Could not open camera")
+                self.log(f"Error: Could not open camera {cam_idx}")
+                messagebox.showerror("Camera Error", f"Could not open camera {cam_idx}")
                 return
             
             self.tracking_active = True
             self.track_btn.config(text="Stop Tracking")
+            self.cam_combo.config(state="disabled")  # Disable camera selection while tracking
             
             # Start tracking loop
             threading.Thread(target=self.tracking_loop, daemon=True).start()
     
     def tracking_loop(self):
         """Main tracking loop - calculates motor angles from body position"""
-        while self.tracking_active and self.cap.isOpened():
+        frame_count = 0
+        while self.tracking_active and self.cap and self.cap.isOpened():
             success, image = self.cap.read()
             if not success:
+                self.log(f"Warning: Failed to read frame from camera")
+                time.sleep(0.1)
                 continue
+            
+            frame_count += 1
             
             # Flip for mirror view
             image = cv2.flip(image, 1)
@@ -298,22 +321,35 @@ class MotorControlApp:
             # Send motor packet
             self.send_motor_packet(motor_angles)
             
-            # Update UI preview
-            preview = cv2.resize(debug_frame, (640, 480))
-            preview_rgb = cv2.cvtColor(preview, cv2.COLOR_BGR2RGB)
-            img = Image.fromarray(preview_rgb)
-            imgtk = ImageTk.PhotoImage(image=img)
-            
-            self.root.after(0, self.update_video_label, imgtk)
+            # Update UI preview (only every few frames to reduce load)
+            if frame_count % 2 == 0:  # Update every 2nd frame
+                try:
+                    preview = cv2.resize(debug_frame, (640, 480))
+                    preview_rgb = cv2.cvtColor(preview, cv2.COLOR_BGR2RGB)
+                    img = Image.fromarray(preview_rgb)
+                    imgtk = ImageTk.PhotoImage(image=img)
+                    self.root.after(0, self.update_video_label, imgtk)
+                except Exception as e:
+                    if frame_count % 30 == 0:  # Log error only occasionally
+                        self.log(f"Video update error: {e}")
             
             # Limit FPS
             time.sleep(0.04)  # ~25 FPS
+        
+        # Cleanup when loop exits
+        self.log("Tracking loop ended")
+        if self.cap:
+            self.cap.release()
+            self.cap = None
     
     def update_video_label(self, imgtk):
         """Update video label in UI thread"""
-        if self.video_label:
-            self.video_label.imgtk = imgtk
-            self.video_label.configure(image=imgtk)
+        try:
+            if self.video_label and self.tracking_active:
+                self.video_label.imgtk = imgtk  # Keep reference to prevent garbage collection
+                self.video_label.configure(image=imgtk)
+        except Exception as e:
+            pass  # Silently ignore if widget is destroyed
     
     def send_motor_packet(self, angles):
         """Send motor angles to ESP32"""
