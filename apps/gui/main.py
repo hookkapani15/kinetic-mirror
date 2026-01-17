@@ -7,6 +7,7 @@ Modes: R (README), M (Motors), L (LEDs), B (Both), Q (Quit), C (Camera Switch), 
 Usage:
   python -m apps.gui.main          # Full startup with hardware detection
   python -m apps.gui.main --fast   # Skip startup, use defaults
+    python -m apps.gui.main --led-only  # LED-only GUI without motor controls
 """
 import cv2
 import time
@@ -49,8 +50,9 @@ except ImportError:
     MEDIAPIPE_AVAILABLE = False
     print("⚠️ MediaPipe not available - running in demo mode")
 
-# Check for --fast flag to skip startup screen
+# Check CLI flags
 FAST_MODE = "--fast" in sys.argv or "-f" in sys.argv
+LED_ONLY_MODE = "--led-only" in sys.argv
 print("\n" + "="*60)
 print("🚀 MIRROR BODY ANIMATIONS")
 print("="*60)
@@ -91,7 +93,9 @@ if FAST_MODE:
         "config": config,
     }
     print(f"  Using camera: {startup_result['selected_camera']}")
-    print(f"  Serial port: {config.get('serial_port', 'AUTO')}")
+    print(f"  LED serial: {config.get('led_serial_port', config.get('serial_port', 'AUTO'))}")
+    if not LED_ONLY_MODE:
+        print(f"  Motor serial: {config.get('motor_serial_port', config.get('serial_port', 'AUTO'))}")
 else:
     # FULL MODE - Run startup screen with visual detection
     from .startup.startup_screen import run_startup_screen
@@ -105,6 +109,9 @@ else:
     print(f"  ESP32: {startup_result['esp32_type']} on {startup_result['esp32_port']}")
     print(f"  Camera: {startup_result['selected_camera']}")
     print(f"  Ready: {'Yes' if startup_result['ready'] else 'Partial'}")
+    print(f"  LED serial: {config.get('led_serial_port', config.get('serial_port', 'AUTO'))}")
+    if not LED_ONLY_MODE:
+        print(f"  Motor serial: {config.get('motor_serial_port', config.get('serial_port', 'AUTO'))}")
     
     # Use startup config
     config = startup_result['config']
@@ -112,6 +119,10 @@ else:
 # Ensure all required keys exist
 config.setdefault("serial_port", "AUTO")
 config.setdefault("baud_rate", 460800)
+config.setdefault("led_serial_port", config.get("serial_port", "AUTO"))
+config.setdefault("motor_serial_port", config.get("serial_port", "AUTO"))
+config.setdefault("led_baud_rate", config.get("baud_rate", 460800))
+config.setdefault("motor_baud_rate", config.get("baud_rate", 460800))
 config.setdefault("camera_index", startup_result['selected_camera'])
 config.setdefault("camera_width", 640)
 config.setdefault("camera_height", 480)
@@ -133,7 +144,8 @@ CONFIG_FILE = CONFIG_DIR / "config.json"
 HEALTH_LOG = LOG_DIR / "health_log.jsonl"
 
 class MirrorGUI:
-    def __init__(self):
+    def __init__(self, led_only: bool = False):
+        self.led_only = led_only
         self.mode = "README"  # Start in README mode for main menu
         self.running = True
         self.camera_index = config['camera_index']
@@ -143,20 +155,42 @@ class MirrorGUI:
         self.health_log_path = HEALTH_LOG
         
         # Rate limiting for serial
-        self.last_serial_send_time = 0
-        self.serial_min_interval = 0.066  # Safer 15 packets per second (prevents freeze)
+        self.last_servo_send_time = 0
+        self.servo_min_interval = 0.066  # Safer 15 packets per second (prevents freeze)
         self.last_led_send_time = 0
-        self.led_min_interval = 0.055     # Approx 18 FPS for LED packets (bandwidth limit)
+        self.led_min_interval = 0.035    # ~28 FPS at 460800 baud for 2048-byte frames
         
-        # Initialize motor controller (32 servos across 2 PCA9685 boards)
-        self.motor = MotorController(num_servos=32)
-        print("✅ Motor controller initialized (32 servos)")
+        # Initialize motor controller (optional in LED-only builds)
+        if self.led_only:
+            self.motor = None
+            print("ℹ️ LED-only mode: motor controller disabled")
+        else:
+            self.motor = MotorController(num_servos=32)
+            print("✅ Motor controller initialized (32 servos)")
         self.led = LEDController(
             width=config['led_width'],
             height=config['led_height']
         )
-        self.serial = SerialManager(config['serial_port'], config['baud_rate'])
-        self.serial.start()
+        led_port = config.get('led_serial_port', config['serial_port'])
+        led_baud = config.get('led_baud_rate', config['baud_rate'])
+        self.led_serial = SerialManager(led_port, led_baud)
+        self.led_serial.start()
+
+        if self.led_only:
+            config['motor_serial_port'] = 'DISABLED'
+            self.motor_serial = None
+        else:
+            motor_port = config.get('motor_serial_port', config['serial_port'])
+            motor_baud = config.get('motor_baud_rate', config['baud_rate'])
+            self.motor_serial = None
+            if str(motor_port).upper() not in {"", "NONE", "DISABLED"}:
+                if motor_port == led_port:
+                    self.motor_serial = self.led_serial
+                else:
+                    self.motor_serial = SerialManager(motor_port, motor_baud)
+                    self.motor_serial.start()
+
+        self.serial = self.led_serial  # Backward compatibility for legacy calls
         
         # Initialize MediaPipe (if available)
         if MEDIAPIPE_AVAILABLE:
@@ -193,6 +227,11 @@ class MirrorGUI:
         self.show_fault_overlay = False
         self.fault_overlay_time = 0
 
+        if self.led_only:
+            self.allowed_modes = {"README", "LED", "LED_TEST"}
+        else:
+            self.allowed_modes = {"README", "MOTOR", "LED", "BOTH", "LED_TEST"}
+
     # ═══════════════════════════════════════════════════════════════
     # Logging helpers
     # ═══════════════════════════════════════════════════════════════
@@ -219,7 +258,7 @@ class MirrorGUI:
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, config['camera_width'])
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config['camera_height'])
         self.camera_index = index
-        
+
     def switch_camera(self):
         """Switch to next available camera"""
         # Detect cameras
@@ -241,6 +280,7 @@ class MirrorGUI:
             print(f"✓ Switched to camera {new_camera}")
         else:
             print("⚠ Only one camera available")
+
     
     def _generate_numbers_pattern(self):
         """Generate pattern with numbers 1-8 on each panel"""
@@ -346,14 +386,22 @@ class MirrorGUI:
             success = tester.run_full_suite()
             
             # Populate results for overlay (compatibility)
+            led_connected = bool(self.led_serial and self.led_serial.connected)
+            motor_connected = led_connected
+            if self.motor_serial and self.motor_serial is not self.led_serial:
+                motor_connected = bool(self.motor_serial.connected)
             self.diagnostic_results = {
-                'serial': {'connected': self.serial.connected if self.serial else False},
+                'serial': {
+                    'led_connected': led_connected,
+                    'motor_connected': motor_connected
+                },
                 'camera': {'connected': self.cap.isOpened() if self.cap else False},
                 'mediapipe': {'loaded': self.pose is not None},
                 'performance': {'fps': self.fps},
                 'system': {
                     'camera_index': self.camera_index,
-                    'serial_port': config['serial_port'],
+                    'led_port': config.get('led_serial_port'),
+                    'motor_port': config.get('motor_serial_port'),
                     'mode': self.mode
                 }
             }
@@ -381,12 +429,29 @@ class MirrorGUI:
             
             # Test 1: Serial/Hardware Check
             print("\n[1/5] Serial/Hardware Check...")
-            if self.serial and self.serial.ser and self.serial.ser.is_open:
-                print("✓ Serial port connected")
-                results['serial'] = {'connected': True}
+            led_ready = bool(self.led_serial and getattr(self.led_serial, "ser", None)
+                              and self.led_serial.ser.is_open)
+            if led_ready:
+                print("✓ LED controller link connected")
             else:
-                print("✗ No ESP32 connected - motors/LEDs won't work")
-                results['serial'] = {'connected': False, 'error': 'No hardware connected'}
+                print("✗ LED controller link missing")
+
+            if self.motor_serial and self.motor_serial is not self.led_serial:
+                motor_ready = bool(getattr(self.motor_serial, "ser", None)
+                                   and self.motor_serial.ser.is_open)
+                if motor_ready:
+                    print("✓ Motor controller link connected")
+                else:
+                    print("✗ Motor controller link missing")
+            else:
+                motor_ready = led_ready  # Shared link or no dedicated motor port
+
+            results['serial'] = {
+                'led_connected': led_ready,
+                'motor_connected': motor_ready
+            }
+            if not led_ready and not motor_ready:
+                results['serial']['error'] = 'No hardware connected'
             
             # Test 2: Camera Detection (use cached info, don't re-scan)
             print("\n[2/5] Camera Detection...")
@@ -467,11 +532,13 @@ class MirrorGUI:
             print("\n[5/5] System Summary...")
             results['system'] = {
                 'camera_index': self.camera_index,
-                'serial_port': config['serial_port'],
+                'led_port': config.get('led_serial_port'),
+                'motor_port': config.get('motor_serial_port'),
                 'mode': self.mode
             }
             print(f"  Camera: {self.camera_index}")
-            print(f"  Serial: {config['serial_port']}")
+            print(f"  LED Port: {config.get('led_serial_port')}")
+            print(f"  Motor Port: {config.get('motor_serial_port')}")
             print(f"  Mode: {self.mode}")
             
             # Generate summary
@@ -481,8 +548,9 @@ class MirrorGUI:
             
             issues = []
             
-            if not results.get('serial', {}).get('connected'):
-                issues.append("✗ ESP32 not connected - connect hardware to COM port")
+            serial_status = results.get('serial', {})
+            if not serial_status.get('led_connected') and not serial_status.get('motor_connected'):
+                issues.append("✗ ESP32 links not connected - connect LED/motor controllers")
             
             if not results.get('camera', {}).get('working_cameras'):
                 issues.append("✗ No cameras detected - check webcam connection")
@@ -560,15 +628,20 @@ class MirrorGUI:
         print("⚡ EMERGENCY HARDWARE TEST")
         print("="*50)
         
-        if not self.serial or not self.serial.ser or not self.serial.ser.is_open:
-            print("✗ No serial connection - cannot test hardware!")
-            # Show overlay warning
+        led_ready = bool(self.led_serial and getattr(self.led_serial, "ser", None)
+                          and self.led_serial.ser.is_open)
+        motor_link = self.motor_serial or self.led_serial
+        motor_ready = bool(motor_link and getattr(motor_link, "ser", None)
+                           and motor_link.ser.is_open)
+
+        if not led_ready and not motor_ready:
+            print("✗ No serial connections - cannot test hardware!")
             self.diagnostic_results = {
                 'serial': {'connected': False},
                 'camera': {'working_cameras': []},
                 'mediapipe': {'avg_fps': self.fps},
                 'pose': {'detections': 0},
-                'emergency': 'No serial connection'
+                'emergency': 'No LED or motor link'
             }
             self.show_diagnostic_overlay = True
             self.diagnostic_overlay_time = time.time()
@@ -579,7 +652,8 @@ class MirrorGUI:
             print("\n[1/3] Flashing LEDs WHITE...")
             white_frame = np.ones((self.led.height, self.led.width, 3), dtype=np.uint8) * 255
             led_packet = self.led.pack_led_packet(white_frame)
-            self.serial.send_led(led_packet)
+            if led_ready:
+                self.led_serial.send_led(led_packet)
             time.sleep(0.5)
             
             # Flash red
@@ -587,32 +661,35 @@ class MirrorGUI:
             red_frame = np.zeros((self.led.height, self.led.width, 3), dtype=np.uint8)
             red_frame[:, :, 2] = 255  # Red channel
             led_packet = self.led.pack_led_packet(red_frame)
-            self.serial.send_led(led_packet)
+            if led_ready:
+                self.led_serial.send_led(led_packet)
             time.sleep(0.5)
             
             # Test 2: Move all servos to center
-            print("[3/3] Moving ALL servos to CENTER (90°)...")
-            center_angles = [90] * self.motor.num_servos
-            servo_packet = self.motor.pack_servo_packet(center_angles)
-            self.serial.send_servo(servo_packet)
-            time.sleep(0.5)
-            
-            # Move to min
-            print("     Moving to MIN (0°)...")
-            min_angles = [0] * self.motor.num_servos
-            servo_packet = self.motor.pack_servo_packet(min_angles)
-            self.serial.send_servo(servo_packet)
-            time.sleep(0.5)
-            
-            # Back to center
-            print("     Moving back to CENTER...")
-            servo_packet = self.motor.pack_servo_packet(center_angles)
-            self.serial.send_servo(servo_packet)
+            if motor_ready:
+                print("[3/3] Moving ALL servos to CENTER (90°)...")
+                center_angles = [90] * self.motor.num_servos
+                servo_packet = self.motor.pack_servo_packet(center_angles)
+                motor_link.send_servo(servo_packet)
+                time.sleep(0.5)
+
+                print("     Moving to MIN (0°)...")
+                min_angles = [0] * self.motor.num_servos
+                servo_packet = self.motor.pack_servo_packet(min_angles)
+                motor_link.send_servo(servo_packet)
+                time.sleep(0.5)
+
+                print("     Moving back to CENTER...")
+                servo_packet = self.motor.pack_servo_packet(center_angles)
+                motor_link.send_servo(servo_packet)
+            else:
+                print("[3/3] Skipping servo exercise (motor link unavailable)")
             
             # Clear LEDs
             black_frame = np.zeros((self.led.height, self.led.width, 3), dtype=np.uint8)
             led_packet = self.led.pack_led_packet(black_frame)
-            self.serial.send_led(led_packet)
+            if led_ready:
+                self.led_serial.send_led(led_packet)
             
             print("\n✓ EMERGENCY TEST COMPLETE!")
             print("  If LEDs flashed and servos moved → Wires are connected!")
@@ -620,11 +697,12 @@ class MirrorGUI:
             print("="*50)
             # Show success overlay
             self.diagnostic_results = {
-                'serial': {'connected': True},
+                'serial': {'connected': led_ready or motor_ready},
                 'camera': {'working_cameras': self.available_cameras or []},
                 'mediapipe': {'avg_fps': self.fps},
                 'pose': {'detections': 0},
-                'emergency': 'OK'
+                'emergency': 'OK' if led_ready else 'LED skipped',
+                'motors': {'tested': motor_ready}
             }
             self.show_diagnostic_overlay = True
             self.diagnostic_overlay_time = time.time()
@@ -669,7 +747,8 @@ class MirrorGUI:
             'error': err_str,
             'mode': self.mode,
             'camera_index': self.camera_index,
-            'serial_port': config.get('serial_port'),
+            'led_port': config.get('led_serial_port'),
+            'motor_port': config.get('motor_serial_port'),
         }
         self.log_event("fault", fault_info)
         self.last_fault = fault_info
@@ -718,7 +797,7 @@ class MirrorGUI:
         panel_width = 200
         panel_x = w - panel_width - 10
         panel_y = 10
-        panel_height = 180
+        panel_height = 220
         
         # Semi-transparent panel
         overlay = frame.copy()
@@ -737,21 +816,45 @@ class MirrorGUI:
         y = panel_y + 45
         line_h = 22
         
-        # Device
-        device_name = config.get('serial_port', 'AUTO')
-        if self.serial and self.serial.ser and self.serial.ser.is_open:
-            cv2.putText(frame, f"Device: {device_name}", (panel_x + 10, y),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
-        else:
-            cv2.putText(frame, "Device: DISCONNECTED", (panel_x + 10, y),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
+        # LED device
+        led_port = config.get('led_serial_port', 'AUTO')
+        led_ready = bool(self.led_serial and getattr(self.led_serial, "ser", None)
+                          and self.led_serial.ser.is_open)
+        led_color = (0, 255, 0) if led_ready else (0, 0, 255)
+        led_label = f"LED: {led_port}" if led_ready else "LED: DISCONNECTED"
+        cv2.putText(frame, led_label, (panel_x + 10, y),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, led_color, 1)
         y += line_h
+
+        if self.led_only:
+            cv2.putText(frame, "Motor: DISABLED", (panel_x + 10, y),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (128, 128, 128), 1)
+            y += line_h
+        else:
+            motor_port = config.get('motor_serial_port', 'AUTO')
+            motor_ready = False
+            if self.motor_serial:
+                if self.motor_serial is self.led_serial:
+                    motor_ready = led_ready
+                else:
+                    motor_ready = bool(getattr(self.motor_serial, "ser", None) and self.motor_serial.ser.is_open)
+            motor_color = (0, 255, 0) if motor_ready else (0, 0, 255)
+            motor_label = f"Motor: {motor_port}" if motor_ready else "Motor: DISCONNECTED"
+            cv2.putText(frame, motor_label, (panel_x + 10, y),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, motor_color, 1)
+            y += line_h
         
         # Baud rate
-        baud = config.get('baud_rate', 460800)
-        cv2.putText(frame, f"Baud: {baud}", (panel_x + 10, y),
+        baud = config.get('led_baud_rate', 460800)
+        cv2.putText(frame, f"LED Baud: {baud}", (panel_x + 10, y),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
         y += line_h
+
+        if not self.led_only:
+            motor_baud = config.get('motor_baud_rate', config.get('baud_rate', 460800))
+            cv2.putText(frame, f"Motor Baud: {motor_baud}", (panel_x + 10, y),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+            y += line_h
         
         # Camera
         cv2.putText(frame, f"Camera: {self.camera_index}", (panel_x + 10, y),
@@ -761,6 +864,12 @@ class MirrorGUI:
         # WiFi (placeholder - could be expanded)
         cv2.putText(frame, "WiFi: Disabled", (panel_x + 10, y),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (128, 128, 128), 1)
+        y += line_h
+
+        pose_status = "Pose: ENABLED" if MEDIAPIPE_AVAILABLE else "Pose: DEMO MODE (install mediapipe)"
+        pose_color = (0, 255, 0) if MEDIAPIPE_AVAILABLE else (0, 165, 255)
+        cv2.putText(frame, pose_status, (panel_x + 10, y),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, pose_color, 1)
         y += line_h
         
         # FPS
@@ -856,23 +965,44 @@ class MirrorGUI:
                     cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
         
         # Instructions
-        instructions = [
-            "",
-            "KEYBOARD CONTROLS:",
-            "",
-            "R - README (this screen)",
-            "M - MOTOR Mode (servos only)",
-            "L - LED Mode (display only)",
-            "B - BOTH Mode (servos + LEDs)",
-            "C - Switch Camera",
-            "D - Run DIAGNOSTICS",
-            "E - EMERGENCY TEST (verify wires)",
-            "Q - QUIT",
-            "",
-            f"Current Mode: {self.mode}",
-            f"Camera: {self.camera_index}",
-            f"Serial: {config['serial_port']} @ {config['baud_rate']}",
-        ]
+        if self.led_only:
+            instructions = [
+                "",
+                "KEYBOARD CONTROLS:",
+                "",
+                "R - README (this screen)",
+                "L - LED Mode (display only)",
+                "T - LED TEST Mode",
+                "C - Switch Camera",
+                "D - Run DIAGNOSTICS",
+                "Q - QUIT",
+                "",
+                "Motor features disabled in LED-only build",
+                "",
+                f"Current Mode: {self.mode}",
+                f"Camera: {self.camera_index}",
+                f"LED Serial: {config.get('led_serial_port')} @ {config.get('led_baud_rate', config.get('baud_rate', 460800))}",
+            ]
+        else:
+            instructions = [
+                "",
+                "KEYBOARD CONTROLS:",
+                "",
+                "R - README (this screen)",
+                "M - MOTOR Mode (servos only)",
+                "L - LED Mode (display only)",
+                "B - BOTH Mode (servos + LEDs)",
+                "T - LED TEST Mode",
+                "C - Switch Camera",
+                "D - Run DIAGNOSTICS",
+                "E - EMERGENCY TEST (verify wires)",
+                "Q - QUIT",
+                "",
+                f"Current Mode: {self.mode}",
+                f"Camera: {self.camera_index}",
+                f"LED Serial: {config.get('led_serial_port')} @ {config.get('led_baud_rate', config.get('baud_rate', 460800))}",
+                f"Motor Serial: {config.get('motor_serial_port')} @ {config.get('motor_baud_rate', config.get('baud_rate', 460800))}",
+            ]
         
         y = 110
         for line in instructions:
@@ -901,14 +1031,21 @@ class MirrorGUI:
         print("MIRROR BODY ANIMATIONS - INTERACTIVE GUI")
         print("="*70)
         print(f"\nMode: {self.mode}")
-        print("Press R for README, M for Motors, L for LEDs, B for Both")
-        print("Press D for Diagnostics, C to switch camera, Q to quit\n")
+        if self.led_only:
+            print("LED-only build: motor controls hidden")
+            print("Press R for README, L for LEDs, T for LED tests")
+            print("Press D for Diagnostics, C to switch camera, Q to quit\n")
+        else:
+            print("Press R for README, M for Motors, L for LEDs, B for Both")
+            print("Press D for Diagnostics, C to switch camera, Q to quit\n")
         
         cv2.namedWindow("Mirror Body Animations", cv2.WINDOW_NORMAL)
         cv2.setWindowProperty("Mirror Body Animations", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
         
         while self.running:
             frame_start = time.time()
+            if self.mode not in self.allowed_modes:
+                self.mode = "LED" if self.led_only else "README"
             try:
                 ret, frame = self.cap.read()
                 if not ret:
@@ -1050,7 +1187,8 @@ class MirrorGUI:
                     
                     # Send GRAYSCALE to ESP32 (firmware expects single byte per pixel)
                     packet = self.led.pack_led_packet(led_pattern_flipped)
-                    self.serial.send_led(packet)
+                    if self.led_serial:
+                        self.led_serial.send_led(packet)
                     
                     # Create RGB for DISPLAY ONLY (not for ESP32)
                     led_rgb = np.stack([led_pattern, led_pattern, led_pattern], axis=2)
@@ -1115,7 +1253,9 @@ class MirrorGUI:
                             # Demo mode - simulate motor movement based on human position
                             angles = [90 + 20 * np.sin(time.time() * 2 + i * 0.5) for i in range(32)]  # Simulate movement
                             packet = self.motor.pack_servo_packet(angles)
-                            self.serial.send_servo(packet)
+                            motor_link = self.motor_serial or self.led_serial
+                            if motor_link:
+                                motor_link.send_servo(packet)
                             status = "DEMO MODE - Simulated Tracking"
                             # Create silhouette simulation
                             silhouette = np.zeros_like(frame)
@@ -1158,7 +1298,8 @@ class MirrorGUI:
                                 
                                 # RATE LIMITING & VALIDATION
                                 current_time = time.time()
-                                if current_time - self.last_serial_send_time > self.serial_min_interval:
+                                motor_link = self.motor_serial or self.led_serial
+                                if motor_link and current_time - self.last_servo_send_time > self.servo_min_interval:
                                     try:
                                         # Validate angles before packing
                                         valid_angles = []
@@ -1179,10 +1320,9 @@ class MirrorGUI:
                                         if packet is None or len(packet) == 0:
                                             print("⚠ Invalid packet generated, skipping send")
                                         else:
-                                            # DEFENSIVE: send_servo now handles all errors gracefully
-                                            success = self.serial.send_servo(packet)
+                                            success = motor_link.send_servo(packet)
                                             if success:
-                                                self.last_serial_send_time = current_time
+                                                self.last_servo_send_time = current_time
                                     except ValueError as e:
                                         print(f"⚠ Servo value error: {e}")
                                     except Exception as e:
@@ -1312,7 +1452,7 @@ class MirrorGUI:
                         
                         if time.time() - self.last_led_send_time > self.led_min_interval:
                             packet = self.led.pack_led_packet(led_frame)
-                            if self.serial.send_led(packet):
+                            if self.led_serial and self.led_serial.send_led(packet):
                                 self.last_led_send_time = time.time()
                         
                         # Create split-screen display: Left = Simulation/Silhouette, Right = Camera
@@ -1344,12 +1484,16 @@ class MirrorGUI:
                     # - Human detected → motors track position, LEDs show silhouette
                     # Both systems run without blocking each other
                     
+                    motor_link = self.motor_serial or self.led_serial
+
                     if not MEDIAPIPE_AVAILABLE:
                         # Demo mode - simulate both systems with LED precedence
                         # No human detection available, so motors stay still, LEDs show text
-                        angles = [90] * 6  # Motors stay still (neutral position)
+                        # Hold every configured servo at neutral.
+                        angles = [90] * self.motor.num_servos
                         servo_packet = self.motor.pack_servo_packet(angles)
-                        self.serial.send_servo(servo_packet)
+                        if motor_link:
+                            motor_link.send_servo(servo_packet)
                         
                         led_frame = np.zeros((config['led_height'], config['led_width'], 3), dtype=np.uint8)
                         # Render "HOOKKAPANI STUDIOS" text on LED matrix
@@ -1380,7 +1524,8 @@ class MirrorGUI:
                             # Human detected → both motors and LEDs activate
                             angles = self.motor.calculate_angles(pose_results)
                             servo_packet = self.motor.pack_servo_packet(angles)
-                            self.serial.send_servo(servo_packet)
+                            if motor_link:
+                                motor_link.send_servo(servo_packet)
                             
                             seg_mask = pose_results.segmentation_mask if pose_results and hasattr(pose_results, 'segmentation_mask') else None
                             led_frame = self.led.render_frame(pose_results, seg_mask)
@@ -1388,9 +1533,9 @@ class MirrorGUI:
                         else:
                             # No human detected → motors stay still, LEDs show "HOOKKAPANI STUDIOS"
                             # STRICT MODE: Motors must remain still (no jitter/drift) -> Do NOT send packets
-                            # angles = [90] * 6  # REMOVED: Centering causes movement
+                            # angles = [90] * self.motor.num_servos  # REMOVED: Centering causes movement
                             # servo_packet = self.motor.pack_servo_packet(angles)
-                            # self.serial.send_servo(servo_packet)
+                            # motor_link.send_servo(servo_packet)
                             
                             led_frame = np.zeros((config['led_height'], config['led_width'], 3), dtype=np.uint8)
                             # Render "HOOKKAPANI STUDIOS" text on LED matrix
@@ -1421,7 +1566,7 @@ class MirrorGUI:
                     
                     if time.time() - self.last_led_send_time > self.led_min_interval:
                         led_packet = self.led.pack_led_packet(led_frame)
-                        if self.serial.send_led(led_packet):
+                        if self.led_serial and self.led_serial.send_led(led_packet):
                             self.last_led_send_time = time.time()
                     
                     # Create split-screen display: Left = Simulation/Silhouette, Right = Camera
@@ -1494,32 +1639,49 @@ class MirrorGUI:
                     print("Mode: README")
                     self.log_event("mode_change", {"mode": self.mode})
                 elif key == ord('m') or key == ord('M'):
-                    self.mode = "MOTOR"
-                    print("Mode: MOTOR (servos only)")
-                    self.log_event("mode_change", {"mode": self.mode})
+                    if self.led_only:
+                        print("⚠ Motor mode disabled in LED-only GUI")
+                    else:
+                        self.mode = "MOTOR"
+                        print("Mode: MOTOR (servos only)")
+                        self.log_event("mode_change", {"mode": self.mode})
                 elif key == ord('l') or key == ord('L'):
                     self.mode = "LED"
                     print("Mode: LED (display only)")
                     self.log_event("mode_change", {"mode": self.mode})
                 elif key == ord('b') or key == ord('B'):
-                    self.mode = "BOTH"
-                    print("Mode: BOTH (full system)")
-                    self.log_event("mode_change", {"mode": self.mode})
+                    if self.led_only:
+                        print("⚠ BOTH mode disabled in LED-only GUI")
+                    else:
+                        self.mode = "BOTH"
+                        print("Mode: BOTH (full system)")
+                        self.log_event("mode_change", {"mode": self.mode})
                 elif key == ord('c') or key == ord('C'):
                     self.switch_camera()
                     self.log_event("camera_switch", {"camera": self.camera_index})
                 elif key == ord('k') or key == ord('K'):
-                    print("Attempting to reconnect serial...")
-                    self.serial.close()
-                    time.sleep(1)
-                    if self.serial.connect():
-                        print("Reconnect successful!")
-                    else:
-                        print("Reconnect failed.")
+                    print("Attempting to reconnect serial links...")
+                    if self.led_serial:
+                        self.led_serial.close()
+                        time.sleep(0.5)
+                        if self.led_serial.connect():
+                            print("✓ LED link reconnected")
+                        else:
+                            print("✗ LED link reconnect failed")
+                    if not self.led_only and self.motor_serial and self.motor_serial is not self.led_serial:
+                        self.motor_serial.close()
+                        time.sleep(0.5)
+                        if self.motor_serial.connect():
+                            print("✓ Motor link reconnected")
+                        else:
+                            print("✗ Motor link reconnect failed")
                 elif key == ord('d') or key == ord('D'):
                     self.safe_run_diagnostics()
                 elif key == ord('e') or key == ord('E'):
-                    self.safe_emergency_test()  # Test motors/LEDs
+                    if self.led_only:
+                        print("⚠ Emergency test requires motor hardware and is disabled in LED-only GUI")
+                    else:
+                        self.safe_emergency_test()  # Test motors/LEDs
                 elif key == ord('q') or key == ord('Q'):
                     self.running = False
                     print("Quitting...")
@@ -1531,14 +1693,17 @@ class MirrorGUI:
         # Cleanup
         self.cap.release()
         cv2.destroyAllWindows()
-        self.serial.stop()
+        if self.led_serial:
+            self.led_serial.stop()
+        if self.motor_serial and self.motor_serial is not self.led_serial:
+            self.motor_serial.stop()
         if self.pose:
             self.pose.close()
         print("✓ Shutdown complete")
 
 if __name__ == "__main__":
     try:
-        gui = MirrorGUI()
+        gui = MirrorGUI(led_only=LED_ONLY_MODE)
         gui.run()
     except KeyboardInterrupt:
         print("\n✓ Interrupted by user")

@@ -44,14 +44,26 @@ class SerialManager:
                 # Auto-detect ESP32 port
                 ports = serial.tools.list_ports.comports()
                 esp32_port = None
+                if not ports:
+                    print("[ERROR] No serial ports detected - is the ESP32 connected?")
+                    self.last_error = "No serial ports detected"
+                    return False
+
+                print("[INFO] Available serial ports:")
                 for port in ports:
-                    if 'CP210' in port.description or 'CH340' in port.description or 'USB' in port.description:
+                    print(f"   - {port.device}: {port.description}")
+
+                keywords = ("cp210", "ch340", "usb", "silicon", "uart", "esp32", "wch", "ftdi")
+                for port in ports:
+                    desc_lower = port.description.lower() if port.description else ""
+                    hwid_lower = port.hwid.lower() if getattr(port, "hwid", None) else ""
+                    if any(keyword in desc_lower or keyword in hwid_lower for keyword in keywords):
                         esp32_port = port.device
                         break
                 if not esp32_port:
-                    print("[ERROR] No ESP32 serial port found")
-                    self.last_error = "No ESP32 serial port found"
-                    return False
+                    esp32_port = ports[0].device
+                    print(f"[WARN] No known ESP32 bridge detected. Falling back to {esp32_port}. "
+                          "Set config['led_serial_port'] to override.")
                 self.port = esp32_port
 
             if self.port == 'SIMULATOR':
