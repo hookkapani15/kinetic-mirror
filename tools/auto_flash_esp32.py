@@ -56,7 +56,7 @@ class ESP32Flasher:
 
         try:
             result = subprocess.run(
-                ["pio", "run"],
+                [sys.executable, "-m", "platformio", "run"],
                 cwd=str(self.firmware_dir),
                 capture_output=True,
                 text=True,
@@ -98,7 +98,7 @@ class ESP32Flasher:
         # Auto-detect ESP32
         for p in ports:
             desc = p.description.lower()
-            if any(keyword in desc for keyword in ['ch340', 'cp210', 'usb-serial', 'uart', 'esp32']):
+            if any(keyword in desc for keyword in ['ch340', 'cp210', 'usb-serial', 'usb serial', 'uart', 'esp32']):
                 print(f"[OK] Auto-detected ESP32 on {p.device}")
                 return p.device
 
@@ -123,6 +123,7 @@ class ESP32Flasher:
 
     def flash_firmware(self, port: str = None) -> bool:
         """Flash firmware to ESP32"""
+        print(f"DEBUG: inside flash_firmware port={port}", flush=True)
         if not self.firmware_file:
             print("[!] No firmware file available")
             return False
@@ -131,6 +132,8 @@ class ESP32Flasher:
             print(f"[!] Firmware file not found: {self.firmware_file}")
             return False
 
+        print("DEBUG: firmware file exists", flush=True)
+
         port = port or self.detect_esp32()
         if not port:
             print("[!] No ESP32 port specified")
@@ -138,19 +141,20 @@ class ESP32Flasher:
 
         self.port = port
 
-        print(f"\n[*] Flashing firmware...")
-        print(f"    Port: {port}")
-        print(f"    Firmware: {self.firmware_file}")
-        print()
+        print(f"\n[*] Flashing firmware...", flush=True)
+        print(f"    Port: {port}", flush=True)
+        print(f"    Firmware: {self.firmware_file}", flush=True)
+        print("DEBUG: entering loop", flush=True)
 
         # Try different flash methods
         flashers = [
-            self.flash_with_esptool,
+            # self.flash_with_esptool,
             self.flash_with_platformio,
-            self.flash_with_arduino
+            # self.flash_with_arduino
         ]
 
         for flasher in flashers:
+            print(f"DEBUG: trying flasher {flasher.__name__}", flush=True)
             try:
                 if flasher(port):
                     print("\n[OK] Firmware flashed successfully!")
@@ -203,7 +207,7 @@ class ESP32Flasher:
         """Flash using PlatformIO"""
         try:
             result = subprocess.run(
-                ["pio", "run", "--target", "upload", "--upload-port", port],
+                [sys.executable, "-m", "platformio", "run", "--target", "upload", "--upload-port", port],
                 cwd=str(self.firmware_dir),
                 capture_output=True,
                 text=True,

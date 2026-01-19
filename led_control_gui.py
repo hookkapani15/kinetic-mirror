@@ -188,14 +188,22 @@ class LEDControlApp:
         self.led_controller = LEDController(width=32, height=64)
         
         # Detect hardware
+        print(f"[DEBUG] === Starting hardware detection ===")
         self.available_cameras = self._detect_cameras()
+        print(f"[DEBUG] Available cameras: {self.available_cameras}")
         self.available_ports = self._detect_ports()
+        print(f"[DEBUG] Available ports: {self.available_ports}")
+        print(f"[DEBUG] === Hardware detection complete ===")
         
         # Build UI
         self._create_ui()
         
         # Auto-start camera
         self.root.after(500, self._start_camera)
+        
+        # Start Port Monitor
+        self.last_ports = self.available_ports[:]
+        self.root.after(500, self._monitor_ports)
         
         # Cleanup on close
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -215,10 +223,113 @@ class LEDControlApp:
         return cameras if cameras else [0]
 
     def _detect_ports(self):
-        """Find serial ports"""
-        ports = [p.device for p in serial.tools.list_ports.comports()]
+        """Find serial ports - list all available ports (connection tested when user clicks LAUNCH)"""
+        ports = []
+        print(f"[DEBUG] Scanning for serial ports...")
+        for p in serial.tools.list_ports.comports():
+            print(f"[DEBUG] Found: {p.device} - {p.description}")
+            ports.append(p.device)
+            
         ports.append("SIMULATOR")
+        print(f"[DEBUG] Final port list: {ports}")
         return ports
+
+    def _refresh_ports(self):
+        """Refresh the list of available serial ports - manual refresh button"""
+        self.available_ports = self._detect_ports()
+        self.port_combo['values'] = self.available_ports
+        
+        # Get port details for logging
+        real_ports = [p for p in self.available_ports if p != "SIMULATOR"]
+        
+        # Auto-select best port
+        if real_ports:
+            # Prefer COM6 if present
+            if "COM6" in real_ports:
+                self.port_combo.set("COM6")
+            else:
+                self.port_combo.set(real_ports[-1])
+            
+            # Log with descriptions
+            port_details = []
+            for p in real_ports:
+                info = next((port for port in serial.tools.list_ports.comports() if port.device == p), None)
+                desc = info.description if info else "Unknown"
+                port_details.append(f"{p} ({desc})")
+            self._log(f"Found ports: {', '.join(port_details)}")
+        else:
+            self.port_combo.set("SIMULATOR")
+            self._log("No real ports found")
+
+    def _monitor_ports(self):
+        """Periodically check for port changes - runs every 500ms"""
+        if not self.running: return
+        
+        print(f"[DEBUG] Port monitor running...")
+        
+        try:
+            current_ports = self._detect_ports()
+            print(f"[DEBUG] Current ports: {current_ports}")
+            print(f"[DEBUG] Last ports: {self.last_ports}")
+            
+            # Convert to sets for easy comparison (ignoring SIMULATOR for logic)
+            old_set = set(p for p in self.last_ports if p != "SIMULATOR")
+            new_set = set(p for p in current_ports if p != "SIMULATOR")
+            
+            print(f"[DEBUG] Old set: {old_set}")
+            print(f"[DEBUG] New set: {new_set}")
+            
+            # Check for changes
+            added = new_set - old_set
+            removed = old_set - new_set
+            
+            print(f"[DEBUG] Added: {added}")
+            print(f"[DEBUG] Removed: {removed}")
+            
+            if added or removed:
+                print(f"[DEBUG] Ports changed! Updating UI...")
+                self.available_ports = current_ports
+                self.port_combo['values'] = self.available_ports
+                self.last_ports = current_ports
+                
+                # Log changes with details
+                for p in added:
+                    port_info = next((port for port in serial.tools.list_ports.comports() if port.device == p), None)
+                    desc = port_info.description if port_info else "Unknown"
+                    self._log(f"Device connected: {p} ({desc})")
+                for p in removed:
+                    self._log(f"Device disconnected: {p}")
+                    
+                # Handle selection logic
+                current_selection = self.port_var.get()
+                print(f"[DEBUG] Current selection: {current_selection}")
+                
+                # If currently selected port was removed
+                if current_selection in removed:
+                    if new_set:
+                        # Fallback to another real port
+                        new_port = list(new_set)[-1] # Pick last one
+                        self.port_combo.set(new_port)
+                        self._log(f"Auto-switched to {new_port}")
+                    else:
+                        self.port_combo.set("SIMULATOR")
+                        self._log("Switched to SIMULATOR")
+                        
+                # If new port added and we're on SIMULATOR, auto-select it
+                elif added and current_selection == "SIMULATOR":
+                    new_port = list(added)[-1]
+                    self.port_combo.set(new_port)
+                    self._log(f"Auto-selected {new_port}")
+            else:
+                print(f"[DEBUG] No port changes detected")
+                    
+        except Exception as e:
+            print(f"Port monitor error: {e}")
+            import traceback
+            traceback.print_exc()
+            
+        # Schedule next check (every 500ms for faster detection)
+        self.root.after(500, self._monitor_ports)
 
     def _create_ui(self):
         """Build the UI"""
@@ -237,8 +348,29 @@ class LEDControlApp:
         ttk.Label(ctrl_frame, text="Port:").pack(side=tk.LEFT, padx=(0,5))
         self.port_var = tk.StringVar()
         self.port_combo = ttk.Combobox(ctrl_frame, textvariable=self.port_var, width=12, values=self.available_ports)
-        self.port_combo.set("SIMULATOR" if "SIMULATOR" in self.available_ports else self.available_ports[0])
-        self.port_combo.pack(side=tk.LEFT, padx=(0,15))
+        
+        print(f"[DEBUG] Creating port combo with values: {self.available_ports}")
+        
+        # Default to real port if available, otherwise Simulator
+        real_ports = [p for p in self.available_ports if p != "SIMULATOR"]
+        print(f"[DEBUG] Real ports (excluding SIMULATOR): {real_ports}")
+        if real_ports:
+            # Prefer COM6 if present (common for ESP32)
+            if "COM6" in real_ports:
+                self.port_combo.set("COM6")
+                print(f"[DEBUG] Selected COM6")
+            else:
+                self.port_combo.set(real_ports[-1]) # Use last port (often the most recently plugged in)
+                print(f"[DEBUG] Selected {real_ports[-1]}")
+        else:
+            self.port_combo.set("SIMULATOR")
+            print(f"[DEBUG] Selected SIMULATOR")
+            
+        self.port_combo.pack(side=tk.LEFT, padx=(0,5))
+        
+        # Refresh Button
+        self.refresh_btn = ttk.Button(ctrl_frame, text="↻", width=3, command=self._refresh_ports)
+        self.refresh_btn.pack(side=tk.LEFT, padx=(0,15))
         
         # Camera
         ttk.Label(ctrl_frame, text="Camera:").pack(side=tk.LEFT, padx=(0,5))
