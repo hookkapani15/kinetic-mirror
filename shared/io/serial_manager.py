@@ -51,12 +51,19 @@ class SerialManager:
 
                 print("[INFO] Available serial ports:")
                 for port in ports:
-                    print(f"   - {port.device}: {port.description}")
+                    print(f"   - {port.device}: {port.description} | HWID: {port.hwid}")
 
+                # ESP32-S3 native USB uses VID 303A (Espressif), PID 1001
+                esp32s3_vid = "303a"  # Espressif VID for ESP32-S3 native USB
                 keywords = ("cp210", "ch340", "usb", "silicon", "uart", "esp32", "wch", "ftdi")
                 for port in ports:
                     desc_lower = port.description.lower() if port.description else ""
                     hwid_lower = port.hwid.lower() if getattr(port, "hwid", None) else ""
+                    # Check for ESP32-S3 native USB first (VID 303A)
+                    if esp32s3_vid in hwid_lower:
+                        esp32_port = port.device
+                        print(f"[INFO] Detected ESP32-S3 native USB on {port.device}")
+                        break
                     if any(keyword in desc_lower or keyword in hwid_lower for keyword in keywords):
                         esp32_port = port.device
                         break
@@ -75,31 +82,58 @@ class SerialManager:
                  print(f"[OK] Simulation started on {self.port}")
                  return True
 
+            # Check if this is ESP32-S3 native USB
+            port_info = next((p for p in ports if p.device == self.port), None)
+            is_esp32s3_native = port_info and port_info.hwid and "303a" in port_info.hwid.lower()
+
             self.ser = serial.Serial(self.port, self.baudrate, timeout=1, write_timeout=0.1)
             
-            # Force ESP32 Reset via DTR/RTS
-            self.ser.dtr = False
-            self.ser.rts = False
-            time.sleep(0.1)
-            self.ser.dtr = True  # Assert DTR to reset
-            self.ser.rts = True
-            time.sleep(0.1)
-            self.ser.dtr = False # Release
-            self.ser.rts = False
-            time.sleep(1)        # Wait for boot
-            
-            time.sleep(1)  # Wait for connection to stabilize
+            if is_esp32s3_native:
+                # ESP32-S3 native USB - don't toggle DTR/RTS as it causes issues
+                print(f"[INFO] ESP32-S3 native USB - using extended boot wait")
+                self.ser.dtr = False
+                self.ser.rts = False
+                time.sleep(2)  # Longer wait for ESP32-S3 native USB
+            else:
+                # Standard USB-to-serial bridge - use DTR/RTS reset
+                self.ser.dtr = False
+                self.ser.rts = False
+                time.sleep(0.1)
+                self.ser.dtr = True  # Assert DTR to reset
+                self.ser.rts = True
+                time.sleep(0.1)
+                self.ser.dtr = False # Release
+                self.ser.rts = False
+                time.sleep(1)        # Wait for boot
+                time.sleep(1)  # Wait for connection to stabilize
 
             # Test connection by waiting for READY
             ready_received = False
+            bootloader_detected = False
             start_time = time.time()
-            while time.time() - start_time < 15:  # Wait up to 15 seconds for full ESP32 boot (WiFi + servos)
+            timeout = 15 if is_esp32s3_native else 15
+            
+            while time.time() - start_time < timeout:
                 if self.ser.in_waiting:
-                    line = self.ser.readline().decode('utf-8').strip()
+                    line = self.ser.readline().decode('utf-8', errors='ignore').strip()
+                    if line:
+                        print(f"[SERIAL:{self.port}] {line}")
+                        # Check for bootloader mode
+                        if 'waiting for download' in line.lower() or 'download(usb' in line.lower():
+                            print(f"[ERROR] ESP32-S3 on {self.port} is in BOOTLOADER mode!")
+                            print(f"[ERROR] Firmware needs to be flashed. Run: pio run -t upload")
+                            bootloader_detected = True
+                            break
                     if 'READY' in line:
                         ready_received = True
                         break
                 time.sleep(0.1)
+
+            if bootloader_detected:
+                self.last_error = f"ESP32-S3 in bootloader mode - firmware not flashed"
+                self.ser.close()
+                self.ser = None
+                return False
 
             if ready_received:
                 self.connected = True
