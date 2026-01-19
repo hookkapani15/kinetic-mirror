@@ -1,20 +1,21 @@
 #include <Arduino.h>
 /*
 ======================================================================================
-MIRROR PROD ANIMATION - ESP32S3 UNIFIED CONTROLLER
+DANCE MIRROR - ESP32S3 LED CONTROLLER
 ======================================================================================
-Combined body visualization (LEDs) + hand-controlled servos (mechanical mirror)
+Real-time body silhouette display on LED matrix
 
 Hardware:
 - ESP32S3 DevKit
-- 32x64 WS2812B LED Matrix on GPIO 5 & 18 (Body visualization)
-- PCA9685 + 6 Servos on I2C (Hand control)
+- 32x64 WS2812B LED Matrix on GPIO 5 & 18
 
 Communication: 460800 baud
-- LED Packet: 0xAA 0xBB 0x01 + 2048 bytes (body pose)
-- Servo Packet: 0xAA 0xBB 0x02 + 12 bytes (hand angles)
+- LED Full:  0xAA 0xBB 0x01 + 2048 bytes (8-bit brightness)
+- LED 1-bit: 0xAA 0xBB 0x03 + 256 bytes  (packed 1-bit, 8x smaller!)
+- PING:      0xAA 0xBB 0x05 -> responds "PONG"
+- INFO:      0xAA 0xBB 0x06 -> responds device info
 
-Created: 2025-11-25
+LED Branch v2.0 - Optimized for dance tracking
 ======================================================================================
 */
 
@@ -54,12 +55,15 @@ const char *password = "loki@1234";
 
 // ==================== SERIAL PROTOCOL ====================
 #define BAUD_RATE 460800
-#define PACKET_LED_SIZE 2051 // Header(2) + Type(1) + Data(2048)
-#define PACKET_SERVO_SIZE                                                      \
-  67 // Header(2) + Type(1) + ServoData(64) for 32 servos
+#define PACKET_LED_SIZE 2051      // Header(2) + Type(1) + Data(2048)
+#define PACKET_LED_1BIT_SIZE 259  // Header(2) + Type(1) + Data(256) - 1-bit packed
+#define PACKET_SERVO_SIZE 67      // Header(2) + Type(1) + ServoData(64) for 32 servos
 
-#define PKT_TYPE_LED 0x01
-#define PKT_TYPE_SERVO 0x02
+#define PKT_TYPE_LED 0x01         // Full 8-bit brightness
+#define PKT_TYPE_SERVO 0x02       // Servo angles (legacy)
+#define PKT_TYPE_LED_1BIT 0x03    // 1-bit packed LEDs (8x smaller!)
+#define PKT_TYPE_PING 0x05        // Connection test -> responds PONG
+#define PKT_TYPE_INFO 0x06        // Device info request
 
 // ==================== GLOBALS ====================
 CRGB leds_left[LEDS_PER_PIN];
@@ -202,6 +206,59 @@ void processLEDPacket() {
   }
 }
 
+// Process 1-bit packed LED packet (256 bytes = 2048 bits)
+void processLED1BitPacket() {
+  if (packetBuffer[0] == 0xAA && packetBuffer[1] == 0xBB &&
+      packetBuffer[2] == PKT_TYPE_LED_1BIT) {
+    uint8_t *packed = &packetBuffer[3];
+    
+    uint16_t ledIdx = 0;
+    for (uint16_t byteIdx = 0; byteIdx < 256 && ledIdx < NUM_LEDS; byteIdx++) {
+      uint8_t byte = packed[byteIdx];
+      // MSB first: bit 7 is first LED in each byte
+      for (int8_t bit = 7; bit >= 0 && ledIdx < NUM_LEDS; bit--) {
+        bool on = (byte & (1 << bit)) != 0;
+        
+        if (on) {
+          if (ledIdx < LEDS_PER_PIN) {
+            leds_left[ledIdx] = CRGB(255, 255, 255);
+          } else {
+            leds_right[ledIdx - LEDS_PER_PIN] = CRGB(255, 255, 255);
+          }
+        } else {
+          if (ledIdx < LEDS_PER_PIN) {
+            leds_left[ledIdx] = CRGB::Black;
+          } else {
+            leds_right[ledIdx - LEDS_PER_PIN] = CRGB::Black;
+          }
+        }
+        ledIdx++;
+      }
+    }
+    
+    FastLED.show();
+    lastLEDPacket = millis();
+    frameCount++;
+  }
+}
+
+// Handle PING request - respond with PONG
+void processPing() {
+  Serial.println("PONG");
+  Serial.flush();
+}
+
+// Handle INFO request - respond with device capabilities
+void processInfo() {
+  Serial.println("MIRROR-LED-ESP32S3");
+  Serial.println("VERSION:2.0");
+  Serial.println("LEDS:2048");
+  Serial.println("SIZE:32x64");
+  Serial.println("PACKETS:01,03");
+  Serial.println("OK");
+  Serial.flush();
+}
+
 void processServoPacket() {
   if (packetBuffer[0] == 0xAA && packetBuffer[1] == 0xBB &&
       packetBuffer[2] == PKT_TYPE_SERVO) {
@@ -281,8 +338,10 @@ void setup() {
 
   Serial.println("\nREADY! Waiting for data...");
   Serial.println("Packet Types:");
-  Serial.println("  0x01 = Body/LED (2051 bytes)");
-  Serial.println("  0x02 = Hand/Servo (67 bytes)");
+  Serial.println("  0x01 = LED Full (2051 bytes)");
+  Serial.println("  0x03 = LED 1-bit (259 bytes) - OPTIMIZED");
+  Serial.println("  0x05 = PING -> PONG");
+  Serial.println("  0x06 = INFO -> device info");
   Serial.println();
 
   lastFPSUpdate = millis();
@@ -322,9 +381,22 @@ void loop() {
       }
     } else if (packetIndex == 2) {
       // Packet type
-      if (inByte == PKT_TYPE_LED || inByte == PKT_TYPE_SERVO) {
+      if (inByte == PKT_TYPE_LED || inByte == PKT_TYPE_SERVO || 
+          inByte == PKT_TYPE_LED_1BIT || inByte == PKT_TYPE_PING || 
+          inByte == PKT_TYPE_INFO) {
         currentPacketType = inByte;
         packetBuffer[packetIndex++] = inByte;
+        
+        // Handle immediate response packets (no data payload)
+        if (inByte == PKT_TYPE_PING) {
+          processPing();
+          packetIndex = 0;
+          currentPacketType = 0;
+        } else if (inByte == PKT_TYPE_INFO) {
+          processInfo();
+          packetIndex = 0;
+          currentPacketType = 0;
+        }
       } else {
         // Unknown type, reset
         packetIndex = 0;
@@ -333,9 +405,9 @@ void loop() {
     } else if (packetIndex > 2) {
       // Bounds guard to prevent buffer overrun on malformed packets
       uint16_t maxSize = (currentPacketType == PKT_TYPE_LED) ? PACKET_LED_SIZE
-                         : (currentPacketType == PKT_TYPE_SERVO)
-                             ? PACKET_SERVO_SIZE
-                             : PACKET_LED_SIZE; // fallback largest
+                         : (currentPacketType == PKT_TYPE_SERVO) ? PACKET_SERVO_SIZE
+                         : (currentPacketType == PKT_TYPE_LED_1BIT) ? PACKET_LED_1BIT_SIZE
+                         : PACKET_LED_SIZE; // fallback largest
       if (packetIndex >= maxSize) {
         packetIndex = 0;
         currentPacketType = 0;
@@ -350,6 +422,9 @@ void loop() {
       } else if (currentPacketType == PKT_TYPE_SERVO &&
                  packetIndex >= PACKET_SERVO_SIZE) {
         complete = true;
+      } else if (currentPacketType == PKT_TYPE_LED_1BIT &&
+                 packetIndex >= PACKET_LED_1BIT_SIZE) {
+        complete = true;
       }
 
       if (complete) {
@@ -357,6 +432,8 @@ void loop() {
           processLEDPacket();
         } else if (currentPacketType == PKT_TYPE_SERVO) {
           processServoPacket();
+        } else if (currentPacketType == PKT_TYPE_LED_1BIT) {
+          processLED1BitPacket();
         }
         packetIndex = 0;
         currentPacketType = 0;

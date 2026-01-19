@@ -16,12 +16,15 @@ import serial.tools.list_ports
 from PIL import Image, ImageTk
 import numpy as np
 import cv2
-import mediapipe as mp
 import time
+
+# Note: Using OpenCV background subtraction for body detection
+# MediaPipe solutions API is not available in newer versions for Python 3.12
 
 # Import from organized structure
 from leds.controllers.led_controller import LEDController
 from shared.io.mock_serial import MockSerial
+from apps.simulation.sim_visualizer import SimulationVisualizer
 
 
 class LEDControlApp:
@@ -29,7 +32,7 @@ class LEDControlApp:
     LED Control GUI Application
     
     Features:
-    - Real-time body tracking with MediaPipe
+    - Real-time body tracking with OpenCV background subtraction
     - 2048 LED matrix control via ESP32 (32×64)
     - Body silhouette visualization
     - Simulation mode for testing without hardware
@@ -47,8 +50,13 @@ class LEDControlApp:
         
         # Tracking State
         self.tracking_active = False
+        self.tracking_starting = False  # Prevents double-click during init
         self.cap = None
-        self.pose = None
+        self.pose = None  # Kept for compatibility but not used
+        self.bg_subtractor = None  # OpenCV background subtractor
+        self.current_camera_index = None
+        self.sim_window = None
+        self.sim_visualizer = None
         
         # Camera
         self.available_cameras = self.detect_cameras()
@@ -74,6 +82,7 @@ class LEDControlApp:
         # Bind Keys
         self.root.bind('<q>', lambda e: self.on_close())
         self.root.bind('<m>', lambda e: self.disconnect())
+        self.root.bind('<s>', lambda e: self.stop_tracking())
         
         # Handle window close
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -89,6 +98,7 @@ class LEDControlApp:
                     cap.release()
             except:
                 pass
+        print(f"[Camera Detection] Found cameras: {available}")
         return available
     
     def create_widgets(self):
@@ -139,10 +149,13 @@ class LEDControlApp:
             self.cam_combo.set(self.available_cameras[0])
         self.cam_combo.pack(side=tk.LEFT, padx=5)
         
-        self.track_btn = ttk.Button(controls, text="Start Tracking", command=self.toggle_tracking)
-        self.track_btn.pack(side=tk.LEFT, padx=10)
+        self.start_btn = ttk.Button(controls, text="Start Tracking", command=self.start_tracking)
+        self.start_btn.pack(side=tk.LEFT, padx=10)
+
+        self.stop_btn = ttk.Button(controls, text="Stop Tracking", command=self.stop_tracking, state=tk.DISABLED)
+        self.stop_btn.pack(side=tk.LEFT, padx=5)
         
-        ttk.Label(controls, text="(q=Quit, m=Reset)").pack(side=tk.LEFT, padx=5)
+        ttk.Label(controls, text="(q=Quit, m=Reset, s=Stop)").pack(side=tk.LEFT, padx=5)
         
         # Video Preview
         self.video_label = ttk.Label(track_frame)
@@ -172,11 +185,28 @@ class LEDControlApp:
     
     def detect_ports(self):
         """Detect available serial ports"""
-        ports = [p.device for p in serial.tools.list_ports.comports()]
+        port_infos = list(serial.tools.list_ports.comports())
+        ports = [p.device for p in port_infos]
         ports.append("SIMULATOR")
         self.port_combo['values'] = ports
-        if ports:
-            self.port_combo.set(ports[0])
+
+        auto_port = self.auto_select_port(port_infos)
+        if auto_port:
+            self.port_combo.set(auto_port)
+            self.log(f"Auto-selected port: {auto_port}")
+        else:
+            self.port_combo.set("SIMULATOR")
+            self.log("Auto-selected SIMULATOR (no hardware port detected)")
+
+    def auto_select_port(self, port_infos):
+        """Pick the most likely ESP32 port using known USB bridge keywords"""
+        keywords = ("cp210", "ch340", "usb", "silicon", "uart", "esp", "wch", "ftdi", "s3")
+        for info in port_infos:
+            desc = (info.description or "").lower()
+            hwid = (getattr(info, "hwid", "") or "").lower()
+            if any(keyword in desc or keyword in hwid for keyword in keywords):
+                return info.device
+        return port_infos[0].device if port_infos else None
     
     def toggle_connection(self):
         if self.serial_port and self.serial_port.is_open:
@@ -186,6 +216,17 @@ class LEDControlApp:
     
     def connect(self):
         port = self.port_var.get()
+        if not port or port not in self.port_combo['values']:
+            port_infos = list(serial.tools.list_ports.comports())
+            port = self.auto_select_port(port_infos)
+            if port:
+                self.port_var.set(port)
+                self.log(f"Auto-detected port for connection: {port}")
+            else:
+                self.port_var.set("SIMULATOR")
+                port = "SIMULATOR"
+                self.log("Falling back to SIMULATOR (no hardware port detected)")
+
         if not port:
             messagebox.showerror("Error", "Please select a port")
             return
@@ -195,6 +236,10 @@ class LEDControlApp:
                 self.serial_port = MockSerial(port=port, baudrate=460800)
                 self.led_controller.mapping_mode = 0  # RAW for simulation
                 self.log("Connected to SIMULATOR (LED Mode)")
+                try:
+                    self.open_simulator_visualizer()
+                except Exception as viz_err:
+                    self.log(f"Warning: Could not open visualizer: {viz_err}")
             else:
                 self.serial_port = serial.Serial(
                     port=port,
@@ -217,106 +262,229 @@ class LEDControlApp:
     
     def disconnect(self):
         if self.tracking_active:
-            self.toggle_tracking()
+            self.stop_tracking()
         
         if self.serial_port and self.serial_port.is_open:
             self.serial_port.close()
         
+        self.close_simulator_visualizer()
         self.status_var.set("Status: Disconnected")
         self.connect_btn.config(text="Connect")
         self.log("Disconnected")
+
+    def open_simulator_visualizer(self):
+        """Open the simulator visualizer window if not already visible."""
+        try:
+            if self.sim_window and self.sim_window.winfo_exists():
+                self.log("Simulator window already exists")
+                return
+
+            self.log("Creating simulator visualizer window...")
+            self.sim_window = tk.Toplevel(self.root)
+            self.sim_window.title("Virtual ESP32 Visualizer")
+            self.sim_window.geometry("800x600+100+100")
+            self.sim_window.lift()
+            self.sim_window.focus_force()
+            self.log("Toplevel window created, initializing visualizer...")
+            self.sim_visualizer = SimulationVisualizer(self.sim_window)
+            self.log("Simulator visualizer launched successfully")
+        except Exception as e:
+            self.log(f"ERROR opening simulator: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def close_simulator_visualizer(self):
+        """Close simulator visualizer if open."""
+        if self.sim_window and self.sim_window.winfo_exists():
+            self.sim_window.destroy()
+        self.sim_window = None
+        self.sim_visualizer = None
     
-    def toggle_tracking(self):
+    def ensure_connection(self):
+        """Ensure a serial connection exists before starting tracking."""
+        if self.serial_port and getattr(self.serial_port, "is_open", False):
+            return True
+
+        self.log("Serial port not connected. Attempting automatic connection...")
+        self.connect()
+        if self.serial_port and getattr(self.serial_port, "is_open", False):
+            self.log("Serial port connected successfully")
+            return True
+        self.log("Serial port connection attempt failed")
+        return False
+
+    def start_tracking(self):
         if self.tracking_active:
-            self.tracking_active = False
-            self.track_btn.config(text="Start Tracking")
-            if self.cap:
-                self.cap.release()
-                self.cap = None
-            self.log("Tracking Stopped")
-        else:
-            if not self.serial_port or not self.serial_port.is_open:
-                messagebox.showerror("Error", "Please connect to ESP32 first")
-                return
-            
-            try:
-                cam_idx = int(self.cam_combo.get())
-            except:
-                cam_idx = 0
-            
-            self.log(f"Starting LED tracking on camera {cam_idx}...")
-            
-            # Init MediaPipe with Segmentation
-            mp_pose = mp.solutions.pose
-            self.pose = mp_pose.Pose(
-                min_detection_confidence=0.5,
-                min_tracking_confidence=0.5,
-                model_complexity=0,
-                enable_segmentation=True
+            self.log(f"Tracking already active on camera {self.current_camera_index}")
+            return
+
+        if self.tracking_starting:
+            self.log("Already starting tracking, please wait...")
+            return
+
+        if not self.ensure_connection():
+            messagebox.showerror("Error", "Unable to connect to ESP32 or simulator")
+            self.log("Start aborted: no active serial connection")
+            return
+
+        combo_value = self.cam_combo.get()
+        self.log(f"Camera combo value: '{combo_value}'")
+        try:
+            cam_idx = int(combo_value)
+        except:
+            cam_idx = 0
+            self.log(f"Could not parse camera index, defaulting to 0")
+
+        # Disable buttons immediately and set starting flag
+        self.tracking_starting = True
+        self.start_btn.config(state=tk.DISABLED)
+        self.stop_btn.config(state=tk.DISABLED)
+        self.log(f"Starting LED tracking on camera {cam_idx}...")
+
+        # Run initialization in background thread to avoid blocking UI
+        threading.Thread(target=self._init_tracking, args=(cam_idx,), daemon=True).start()
+
+    def _init_tracking(self, cam_idx):
+        """Background initialization of camera and OpenCV background subtractor."""
+        try:
+            self.log("Initializing OpenCV background subtractor...")
+            # Use MOG2 background subtractor for body detection
+            self.bg_subtractor = cv2.createBackgroundSubtractorMOG2(
+                history=500,
+                varThreshold=50,
+                detectShadows=False
             )
-            
+            self.log("Background subtractor initialized")
+
+            # Try preferred backend first, then fallback to default if needed
+            self.log(f"Opening camera {cam_idx} with DirectShow...")
             self.cap = cv2.VideoCapture(cam_idx, cv2.CAP_DSHOW)
-            
-            if not self.cap.isOpened():
-                self.log("Error: Could not open camera")
+            if not self.cap or not self.cap.isOpened():
+                self.log(f"DirectShow failed, trying default backend...")
+                if self.cap:
+                    self.cap.release()
+                self.cap = cv2.VideoCapture(cam_idx)
+
+            if not self.cap or not self.cap.isOpened():
+                self.log(f"Error: Could not open camera {cam_idx}")
+                if self.cap:
+                    self.cap.release()
+                self.cap = None
+                self.bg_subtractor = None
+                self.current_camera_index = None
+                self.tracking_starting = False
+                self.root.after(0, lambda: self.start_btn.config(state=tk.NORMAL))
+                self.root.after(0, lambda: self.stop_btn.config(state=tk.DISABLED))
                 return
-            
+
+            # Set camera properties for better performance
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            self.cap.set(cv2.CAP_PROP_FPS, 30)
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Reduce buffer to minimize latency
+
+            self.current_camera_index = cam_idx
             self.tracking_active = True
-            self.track_btn.config(text="Stop Tracking")
-            
-            # Start tracking loop
-            threading.Thread(target=self.tracking_loop, daemon=True).start()
+            self.tracking_starting = False
+            self.root.after(0, lambda: self.start_btn.config(state=tk.DISABLED))
+            self.root.after(0, lambda: self.stop_btn.config(state=tk.NORMAL))
+            self.log(f"Camera {cam_idx} opened successfully")
+            self.log("Tracking thread started")
+
+            # Run tracking loop directly in this thread
+            self.tracking_loop()
+        except Exception as e:
+            self.log(f"Error initializing tracking: {e}")
+            self.tracking_starting = False
+            self.tracking_active = False
+            self.root.after(0, lambda: self.start_btn.config(state=tk.NORMAL))
+            self.root.after(0, lambda: self.stop_btn.config(state=tk.DISABLED))
+
+    def stop_tracking(self):
+        if not self.tracking_active:
+            self.log("Tracking already stopped")
+            return
+
+        self.tracking_active = False
+        if self.cap:
+            self.cap.release()
+            self.cap = None
+        self.bg_subtractor = None
+        self.pose = None
+        self.current_camera_index = None
+        self.start_btn.config(state=tk.NORMAL)
+        self.stop_btn.config(state=tk.DISABLED)
+        self.log("Tracking Stopped")
     
     def tracking_loop(self):
-        """Main tracking loop - renders body silhouette on LED matrix"""
-        while self.tracking_active and self.cap.isOpened():
-            success, image = self.cap.read()
-            if not success:
-                continue
-            
-            # Flip for mirror view
-            image = cv2.flip(image, 1)
-            image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            
-            # Process Pose with Segmentation
-            results = self.pose.process(image_rgb)
-            
-            # Render LED frame
-            seg_mask = results.segmentation_mask if results.segmentation_mask is not None else None
-            led_frame = self.led_controller.render_frame(results, seg_mask)
-            
-            # Debug visualization
-            debug_frame = image.copy()
-            h, w, _ = debug_frame.shape
-            
-            cv2.putText(debug_frame, "LED CONTROL MODE", (10, 30),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            
-            # LED Visualization Overlay
-            if seg_mask is not None:
-                green_overlay = np.zeros_like(debug_frame)
-                green_overlay[:, :, 1] = (seg_mask * 255).astype(np.uint8)
-                cv2.addWeighted(debug_frame, 1.0, green_overlay, 0.5, 0, debug_frame)
+        """Main tracking loop - renders body silhouette on LED matrix using background subtraction"""
+        try:
+            while self.tracking_active and self.cap and self.cap.isOpened():
+                success, image = self.cap.read()
+                if not success:
+                    continue
+
+                # Flip for mirror view
+                image = cv2.flip(image, 1)
                 
-                cv2.putText(debug_frame, "LEDS: Displaying Body Silhouette", (10, 60),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-            else:
-                cv2.putText(debug_frame, "LEDS: Waiting for body detection...", (10, 60),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100, 100, 100), 1)
-            
-            # Send LED packet
-            self.send_led_packet(led_frame)
-            
-            # Update UI preview
-            preview = cv2.resize(debug_frame, (640, 480))
-            preview_rgb = cv2.cvtColor(preview, cv2.COLOR_BGR2RGB)
-            img = Image.fromarray(preview_rgb)
-            imgtk = ImageTk.PhotoImage(image=img)
-            
-            self.root.after(0, self.update_video_label, imgtk)
-            
-            # Limit FPS
-            time.sleep(0.04)  # ~25 FPS
+                # Apply background subtraction to detect moving objects (person)
+                fg_mask = self.bg_subtractor.apply(image)
+                
+                # Clean up the mask with morphological operations
+                kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+                fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, kernel)
+                fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, kernel)
+                
+                # Additional blur to smooth edges
+                fg_mask = cv2.GaussianBlur(fg_mask, (5, 5), 0)
+                
+                # Threshold to create binary mask
+                _, fg_mask = cv2.threshold(fg_mask, 127, 255, cv2.THRESH_BINARY)
+                
+                # Normalize mask to 0-1 range for LED controller
+                seg_mask = fg_mask.astype(np.float32) / 255.0
+
+                # Render LED frame using the segmentation mask
+                led_frame = self.led_controller.render_frame(None, seg_mask)
+
+                # Debug visualization
+                debug_frame = image.copy()
+                h, w, _ = debug_frame.shape
+
+                cv2.putText(debug_frame, "LED CONTROL MODE (OpenCV)", (10, 30),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+                # LED Visualization Overlay - show detected silhouette in green
+                if np.any(fg_mask > 0):
+                    green_overlay = np.zeros_like(debug_frame)
+                    green_overlay[:, :, 1] = fg_mask
+                    cv2.addWeighted(debug_frame, 1.0, green_overlay, 0.5, 0, debug_frame)
+
+                    cv2.putText(debug_frame, "LEDS: Displaying Body Silhouette", (10, 60),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                else:
+                    cv2.putText(debug_frame, "LEDS: Waiting for movement...", (10, 60),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100, 100, 100), 1)
+
+                # Send LED packet
+                self.send_led_packet(led_frame)
+
+                # Update UI preview
+                preview = cv2.resize(debug_frame, (640, 480))
+                preview_rgb = cv2.cvtColor(preview, cv2.COLOR_BGR2RGB)
+                img = Image.fromarray(preview_rgb)
+                imgtk = ImageTk.PhotoImage(image=img)
+
+                self.root.after(0, self.update_video_label, imgtk)
+
+                # Limit FPS
+                time.sleep(0.033)  # ~30 FPS
+
+        except Exception as e:
+            self.log(f"Tracking error: {e}")
+        finally:
+            if self.tracking_active:
+                self.root.after(0, self.stop_tracking)
     
     def update_video_label(self, imgtk):
         """Update video label in UI thread"""
