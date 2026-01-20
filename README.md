@@ -1,34 +1,47 @@
-# Mechanical Mirror (Motors Branch)
+# Kinetic Mirror - Motor Control System
 
-This is the **Motor Control** specialized branch of the Kinetic Mirror project. It is designed to control a 64-motor array using computer vision to mirror a human silhouette.
+A high-performance kinetic sculpture control system utilizing real-time body silhouette tracking to drive an 8x8 matrix of servo motors.
 
-## Features
-- **Robust Tracking**: Uses MediaPipe Pose Segmentation with a seamless fallback to **MOG2 Background Subtraction**.
-- **Static Detection**: Detects human presence even when standing still (detects "blocked" areas).
-- **Visualization**: High-contrast "Blue Film" background with "Green Body" silhouette for clear feedback.
-- **Motor Control**: Maps the 64-motor grid (8x8) directly to the detected silhouette.
-- **Single App Architecture**: Consolidated GUI for simplified usage.
+## 🚀 Quick Start
 
-## Hardware Support
-- **Microcontroller**: ESP32-S3 (or compatible).
-- **Motors**: 64x SG90 Servos (via PCA9685 drivers).
-- **Camera**: Standard USB Webcam.
+1. **Prerequisites**
+   - Python 3.9+
+   - USB Web Camera
+   - ESP32-S3 with PCA9685 Motor Drivers (Hardware Mode)
 
-## Quick Start
+2. **Installation**
+   ```bash
+   pip install -r requirements.txt
+   ```
 
-### 1. Install Dependencies
-```bash
-pip install -r requirements.txt
-```
+3. **Run Application**
+   Double-click `run.bat` or run:
+   ```bash
+   python -m apps.gui.main
+   ```
 
-### 2. Run the Application
-Simply double-click **`run.bat`** or run via command line:
-```bash
-python -m apps.gui.main
-```
+## 🎮 Features
 
-## Usage
-1.  **Launch the App**: The window will open showing the camera feed.
-2.  **Calibration**: Step out of the frame for 1 second to let the specific background subtractor learn the empty room.
-3.  **Step In**: Walk into the frame. You will see your body highlighted in **Green** against a **Blue** background.
-4.  **Interaction**: The 64 simulated (or real) motors will react to your presence immediately.
+- **Optimized Silhouette Tracking**: Uses high-speed MediaPipe segmentation with temporal smoothing and morphological hole-filling for solid body detection.
+- **Zero-Lag Processing**: Fully optimized pipeline with lower-resolution processing paths and silenced console hot-paths for real-time responsiveness.
+- **Advanced Visualization**: High-contrast Blue (Background) and Green (Human) overlay with 8x8 grid projection.
+- **Hardware Integration**:
+  - Auto-detection of ESP32-S3 devices.
+  - Integrated firmware flasher for easy deployment.
+  - Support for 64 servo motors across 4 PCA9685 drivers.
+- **Manual & Test Modes**: Comprehensive tools for testing motor range, wiring verification, and custom wave patterns.
+
+## 🏗 System Architecture
+
+- **GUI**: Modern dark-themed Tkinter interface.
+- **Tracking Engine**: Custom `BodySegmenter` using MediaPipe Task API.
+- **Communication**: Optimized serial packet protocol (0xAA 0xBB header).
+- **Firmware**: Compatible with the provided ESP32-S3 motor control firmware.
+
+## 🛠 Calibration
+
+- **Live Mode**: Motors will follow your silhouette. Ensure adequate lighting for the camera.
+- **Test Mode**: Use the "Wave" or "Test" buttons to verify all 64 motors are responding correctly.
+
+---
+© 2026 Hookkapaani Kinetic Arts

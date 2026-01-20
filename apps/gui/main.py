@@ -17,6 +17,7 @@ import numpy as np
 import subprocess
 import os
 import sys
+from PIL import Image, ImageTk
 
 # Try to import MediaPipe for body tracking
 MEDIAPIPE_AVAILABLE = False
@@ -94,6 +95,112 @@ PARTITIONS_BIN_ESP32S3 = os.path.join(FIRMWARE_DIR, '.pio', 'build', 'esp32s3', 
 FIRMWARE_BIN = FIRMWARE_BIN_ESP32
 BOOTLOADER_BIN = BOOTLOADER_BIN_ESP32
 PARTITIONS_BIN = PARTITIONS_BIN_ESP32
+
+
+
+class BodySegmenter:
+    """
+    Optimized body segmentation from LED Branch (Secret Sauce)
+    - Clean silhouette extraction
+    - Temporal smoothing (reduces flicker)
+    - Hole filling (solid body)
+    - Edge smoothing
+    """
+    def __init__(self):
+        # Local imports to avoid global dependency issues if not used
+        import mediapipe as mp
+        from mediapipe.tasks import python as mp_python
+        from mediapipe.tasks.python import vision as mp_vision
+        from pathlib import Path
+        import urllib.request
+        import ssl
+        
+        # Ensure data dir exists
+        model_path = Path("data/selfie_segmenter.tflite")
+        model_path.parent.mkdir(exist_ok=True)
+        
+        if not model_path.exists():
+            print("Downloading segmentation model...")
+            url = "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/latest/selfie_segmenter.tflite"
+            # Bypass SSL for robust download
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            with urllib.request.urlopen(url, context=ctx) as u, open(model_path, 'wb') as f:
+                f.write(u.read())
+            print("Model downloaded")
+        
+        base_options = mp_python.BaseOptions(model_asset_path=str(model_path))
+        options = mp_vision.ImageSegmenterOptions(
+            base_options=base_options,
+            running_mode=mp_vision.RunningMode.VIDEO,
+            output_category_mask=True
+        )
+        self.segmenter = mp_vision.ImageSegmenter.create_from_options(options)
+        self.frame_count = 0
+        
+        # Temporal smoothing buffers
+        self.mask_buffer = None
+        self.smoothing = 0.10  # LOWER = more snappy/crisp, higher = smoother/more lag
+        
+        # Morphology kernels (pre-computed for speed)
+        self.kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+        self.kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        self.kernel_dilate = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        
+    def get_body_mask(self, frame):
+        """
+        Extract clean body silhouette with performance optimizations
+        Returns binary mask (0 or 255)
+        """
+        self.frame_count += 1
+        h, w = frame.shape[:2]
+        
+        # PERFORMANCE: Processing at lower resolution significantly reduces lag
+        # model usually takes 256x256, so processing at that size is fine
+        proc_w, proc_h = 256, 144 # 16:9 ratio approximately
+        small_rgb = cv2.resize(frame, (proc_w, proc_h), interpolation=cv2.INTER_LINEAR)
+        small_rgb = cv2.cvtColor(small_rgb, cv2.COLOR_BGR2RGB)
+        
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=small_rgb)
+        
+        # Run segmentation
+        timestamp_ms = int(self.frame_count * 33)
+        result = self.segmenter.segment_for_video(mp_image, timestamp_ms)
+        
+        if result.category_mask is None:
+            return np.zeros((h, w), dtype=np.uint8)
+        
+        # Get raw mask at processing resolution
+        mask = result.category_mask.numpy_view()
+        mask = (mask > 0).astype(np.float32)
+        
+        # Temporal smoothing at low res (faster)
+        if self.mask_buffer is None:
+            self.mask_buffer = mask.copy()
+        else:
+            self.mask_buffer = self.smoothing * self.mask_buffer + (1.0 - self.smoothing) * mask
+        
+        binary = (self.mask_buffer > 0.4).astype(np.uint8) * 255
+        
+        # Faster Morphology at lower resolution
+        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, self.kernel_close)
+        
+        # Solifidy (Fast at low res)
+        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if contours:
+            largest = max(contours, key=cv2.contourArea)
+            binary = np.zeros_like(binary)
+            cv2.drawContours(binary, [largest], -1, 255, cv2.FILLED)
+        
+        binary = cv2.dilate(binary, self.kernel_dilate, iterations=1)
+        
+        # Upscale mask back to original size for display/matching
+        return cv2.resize(binary, (w, h), interpolation=cv2.INTER_NEAREST)
+
+    def close(self):
+        if hasattr(self, 'segmenter'):
+            self.segmenter.close()
 
 
 class ModernButton(tk.Canvas):
@@ -356,13 +463,13 @@ class MotorVisualizer(tk.Canvas):
 
 class CameraPanel(tk.Frame):
     """Live camera feed panel with body tracking"""
-    def __init__(self, parent, on_position_change=None, **kwargs):
+    def __init__(self, parent, on_angle_change=None, **kwargs):
         super().__init__(parent, bg=COLORS['bg_dark'], **kwargs)
-        self.on_position_change = on_position_change
+        self.on_angle_change = on_angle_change
         self.cap = None
         self.running = False
         self.current_camera = None
-        self.pose = None
+        self.body_segmenter = None
         self.body_x = 0.5  # Normalized body position (0-1)
         self.body_detected = False
         self._create_widgets()
@@ -481,8 +588,13 @@ class CameraPanel(tk.Frame):
         except:
             cam_idx = 0
         
+        # Try to open camera with backends if needed
         self.cap = cv2.VideoCapture(cam_idx, cv2.CAP_DSHOW)
         if not self.cap.isOpened():
+            self.cap = cv2.VideoCapture(cam_idx) # Default backend
+            
+        if not self.cap.isOpened():
+            print(f"❌ Failed to open camera {cam_idx}")
             messagebox.showerror("Camera Error", f"Failed to open camera {cam_idx}")
             return
         
@@ -491,24 +603,18 @@ class CameraPanel(tk.Frame):
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
         self.cap.set(cv2.CAP_PROP_FPS, 30)
         
-        # Initialize MediaPipe if available
-        if MEDIAPIPE_AVAILABLE and hasattr(mp_pose, 'Pose'):
-            self.pose = mp_pose.Pose(
-                min_detection_confidence=0.5,
-                min_tracking_confidence=0.5,
-                model_complexity=0,
-                enable_segmentation=True
-            )
-        else:
-            self.pose = None
-            
-        # Fallback: Background Subtractor (MOG2)
-        # Matches user expectation if MediaPipe is broken
-        self.bg_subtractor = cv2.createBackgroundSubtractorMOG2(
-            history=500,
-            varThreshold=16, 
-            detectShadows=False
-        )
+        print(f"📸 Camera {cam_idx} opened successfully")
+        
+        # Initialize BodySegmenter (The Secret Sauce)
+        try:
+            print("⏳ Initializing BodySegmenter...")
+            self.body_segmenter = BodySegmenter()
+            print("✅ BodySegmenter initialized")
+        except Exception as e:
+            print(f"❌ BodySegmenter failed: {e}")
+            import traceback
+            traceback.print_exc()
+            self.body_segmenter = None
         
         self.running = True
         self.start_btn.text = "⏹ Stop"
@@ -517,6 +623,7 @@ class CameraPanel(tk.Frame):
         self.start_btn._draw()
         
         # Start capture thread
+        print("🧵 Starting capture thread...")
         threading.Thread(target=self._capture_loop, daemon=True).start()
     
     def _stop_camera(self):
@@ -527,9 +634,9 @@ class CameraPanel(tk.Frame):
             self.cap.release()
             self.cap = None
         
-        if self.pose:
-            self.pose.close()
-            self.pose = None
+        if self.body_segmenter:
+            self.body_segmenter.close()
+            self.body_segmenter = None
         
         self.start_btn.text = "▶ Start"
         self.start_btn.default_bg = COLORS['success']
@@ -550,60 +657,36 @@ class CameraPanel(tk.Frame):
         )
     
     def _capture_loop(self):
-        """Main camera capture and tracking loop - MEDIAPIPE SILHOUETTE"""
-        # For motion detection fallback
-        prev_frame = None
-        
+        """Main camera capture loop - Powered by BodySegmenter (New API)"""
+        frame_count = 0
         while self.running and self.cap:
             try:
                 ret, frame = self.cap.read()
                 if not ret or frame is None:
+                    frame_count += 1
                     continue
+                
+                frame_count += 1
                 
                 # Flip for mirror effect
                 frame = cv2.flip(frame, 1)
                 h, w = frame.shape[:2]
                 
-                # Process with MediaPipe
+                # Process with BodySegmenter (Robust)
                 self.body_detected = False
+                h, w = frame.shape[:2]
                 
-                if MEDIAPIPE_AVAILABLE and self.pose:
-                    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    results = self.pose.process(rgb_frame)
+                if self.body_segmenter:
+                    # Get robust binary mask (0 or 255)
+                    seg_mask = self.body_segmenter.get_body_mask(frame)
                     
-                    if results.pose_landmarks and hasattr(results, 'segmentation_mask'):
+                    # Check if body present (> 0.5% of pixels)
+                    # seg_mask is 0 or 255.
+                    if np.sum(seg_mask) > (w * h * 0.005 * 255):
                         self.body_detected = True
-                        seg_mask = results.segmentation_mask
-                    elif results.pose_landmarks:
-                        # MediaPipe works but no segmentation? Use landmarks to draw "fake" mask or MOG2?
-                        # Fallback to MOG2 combined with landmarks check?
-                        # For now, let's trust MOG2 if segmentation missing
-                        seg_mask = self.bg_subtractor.apply(frame)
-                        seg_mask = (seg_mask > 200).astype(np.float32)
-                        self.body_detected = True # Assume MOG2 finds something
-                    else:
-                        # MediaPipe found nothing (empty)
-                        # Maybe still use MOG2?
-                        seg_mask = self.bg_subtractor.apply(frame)
-                        seg_mask = (seg_mask > 200).astype(np.float32)
-                        if np.sum(seg_mask) > 100: # Simple area check
-                            self.body_detected = True
-                
                 else:
-                    # MediaPipe Not Available -> Use MOG2
-                    seg_mask = self.bg_subtractor.apply(frame)
-                    
-                    # Clean up noise
-                    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-                    seg_mask = cv2.morphologyEx(seg_mask, cv2.MORPH_OPEN, kernel)
-                    seg_mask = cv2.morphologyEx(seg_mask, cv2.MORPH_CLOSE, kernel)
-                    
-                    # Normalize to 0.0-1.0 like MediaPipe
-                    seg_mask = (seg_mask > 200).astype(np.float32)
-                    
-                    # Check if body present
-                    if np.sum(seg_mask) > (w * h * 0.05): # >5% of screen
-                        self.body_detected = True
+                    seg_mask = np.zeros((h, w), dtype=np.uint8)
+                    self.body_detected = False
 
                 if self.body_detected:
                      # Resize mask to 8x8 for the servo grid
@@ -611,34 +694,31 @@ class CameraPanel(tk.Frame):
                      mask_8x8 = cv2.resize(seg_mask, (8, 8), interpolation=cv2.INTER_AREA)
                      
                      # Create 64-element angle array directly from mask
-                     # Human (mask > 0.2) -> 180 degrees (Active) - Lower threshold to catch partial blocks
+                     # Human (mask > 50) -> 180 degrees (Active)
                      # Background -> 0 degrees (Inactive)
                      angles = []
                      for row in range(8):
                          for col in range(8):
                              val = mask_8x8[row, col]
-                             angle = 180 if val > 0.2 else 0
+                             angle = 180 if val > 50 else 0
                              angles.append(angle)
                      
                      # Send directly to motors
                      if self.on_angle_change:
                          self.on_angle_change(angles)
                          
-                     # VISUALIZATION: "Blue film in background" style
-                     # Mask > 0.5 is Body. Mask <= 0.5 is Background.
-                     mask_display = (seg_mask > 0.5).astype(np.uint8) * 255
+                     # VISUALIZATION: Optimized lower-res visualization
+                     # Do tinting at 320x240 for speed
+                     v_h, v_w = 240, 320
+                     small_frame = cv2.resize(frame, (v_w, v_h), interpolation=cv2.INTER_LINEAR)
+                     small_mask = cv2.resize(seg_mask, (v_w, v_h), interpolation=cv2.INTER_NEAREST)
                      
-                     overlay = frame.copy()
-                     # Apply BLUE tint to BACKGROUND (where mask is 0)
-                     # OpenCV uses BGR, so (255, 0, 0) is Blue
-                     overlay[mask_display == 0] = (255, 0, 0)
+                     overlay = small_frame.copy()
+                     overlay[small_mask == 0] = (255, 0, 0) # Blue
+                     overlay[small_mask == 255] = (0, 255, 0) # Green
                      
-                     # Apply GREEN tint to BODY (where mask is 255)
-                     # OpenCV uses BGR, so (0, 255, 0) is Green
-                     overlay[mask_display == 255] = (0, 255, 0)
-                     
-                     # Blender: 50% Overlay, 50% Original
-                     frame = cv2.addWeighted(overlay, 0.5, frame, 0.5, 0)
+                     blended = cv2.addWeighted(overlay, 0.4, small_frame, 0.6, 0)
+                     frame = cv2.resize(blended, (w, h), interpolation=cv2.INTER_LINEAR)
                      
                      # Draw 8x8 Grid overlay
                      h, w = frame.shape[:2]
@@ -646,7 +726,7 @@ class CameraPanel(tk.Frame):
                      step_y = h / 8
                      for r in range(8):
                          for c in range(8):
-                             if mask_8x8[r, c] > 0.2:
+                             if mask_8x8[r, c] > 50:
                                  # Draw active grid cell outline in Green
                                  x1 = int(c * step_x)
                                  y1 = int(r * step_y)
@@ -656,7 +736,7 @@ class CameraPanel(tk.Frame):
                      
                      # Update body_x for legacy
                      # Calculate center X
-                     contours, _ = cv2.findContours(mask_display, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                     contours, _ = cv2.findContours(seg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                      if contours:
                          largest = max(contours, key=cv2.contourArea)
                          x, y, bw, bh = cv2.boundingRect(largest)
@@ -667,8 +747,11 @@ class CameraPanel(tk.Frame):
                     cv2.putText(frame, "BODY DETECTED", (10, 30),
                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                 
+                # Only update labels every 10 frames to save UI thread
+                if frame_count % 10 == 0:
+                    self._update_tracking_ui()
+                
                 self._update_canvas(frame)
-                self._update_tracking_ui()
             
             except Exception as e:
                 print(f"Capture error: {e}")
@@ -678,7 +761,7 @@ class CameraPanel(tk.Frame):
 
     
     def _update_canvas(self, frame):
-        """Update canvas with new frame (no flicker)"""
+        """Update canvas with new frame (optimized)"""
         try:
             # Get canvas size
             canvas_w = self.video_canvas.winfo_width()
@@ -687,18 +770,18 @@ class CameraPanel(tk.Frame):
             if canvas_w < 10 or canvas_h < 10:
                 return
             
-            # Resize frame to fit canvas while maintaining aspect ratio
+            # Resize frame to fit canvas
             frame_h, frame_w = frame.shape[:2]
             scale = min(canvas_w / frame_w, canvas_h / frame_h)
             new_w = int(frame_w * scale)
             new_h = int(frame_h * scale)
             
-            resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+            # Using INTER_NEAREST for display resize is much faster
+            resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
             img = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-            from PIL import Image, ImageTk
             im = Image.fromarray(img)
             imgtk = ImageTk.PhotoImage(image=im)
-            # Only create image item once, then update it
+            
             if not hasattr(self, '_canvas_img_id'):
                 self._canvas_img_id = self.video_canvas.create_image(
                     canvas_w // 2, canvas_h // 2, image=imgtk, anchor='center')
@@ -1478,7 +1561,7 @@ class SimulationVisualizer:
         content = tk.Frame(main, bg=COLORS['bg_dark'])
         content.pack(fill='both', expand=True)
         # Left: Camera (largest)
-        self.camera_panel = CameraPanel(content, on_position_change=self._on_body_position)
+        self.camera_panel = CameraPanel(content, on_angle_change=self._on_angle_change)
         self.camera_panel.pack(side='left', fill='both', expand=True, padx=(0, 8))
         # Right side panel
         right_panel = tk.Frame(content, bg=COLORS['bg_dark'], width=380)
@@ -1774,13 +1857,9 @@ PCA9685 VCC → 3.3V (logic) | V+ → 5V (servo power)""")
         """Handle angle changes from any source"""
         self.motor_viz.update_angles(angles)
         
-        # Debug log
-        self._log(f"Angle change: sim={self.simulation_mode}, port={self.serial_port is not None}")
-        
         # Always try to send if we have a serial port (hardware mode)
         if self.serial_port:
             self._send_motor_packet(angles)
-            self._log(f"Sent packet for {len(angles)} motors")
         
         if self.simulation_mode and self.virtual_device:
             try:
@@ -1807,17 +1886,13 @@ PCA9685 VCC → 3.3V (logic) | V+ → 5V (servo power)""")
                 packet.append((value >> 8) & 0xFF)  # High byte
                 packet.append(value & 0xFF)         # Low byte
             
-            # Write packet (should be 131 bytes: 3 header + 128 data)
-            bytes_written = self.serial_port.write(packet)
+            # Write packet
+            self.serial_port.write(packet)
             self.serial_port.flush()
             
-            # Debug: log first few angles
-            sample = [int(motor_angles[i]) for i in range(min(4, len(motor_angles)))]
-            self._log(f"Sent {bytes_written} bytes (64 motors), angles: {sample}...")
-            
         except Exception as e:
-            self._log(f"Send error: {e}")
-            self.status_text.config(text=f"Send error: {str(e)[:40]}")
+            # Log only on real failure
+            print(f"Send error: {e}")
     
     def _update_loop(self):
         """Main update loop for simulation sync"""
