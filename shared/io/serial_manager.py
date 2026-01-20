@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Serial Manager for Mirror Body Animations
-Handles threaded serial communication with ESP32
+Handles threaded serial communication with ESP32/ESP32-S3
 """
 
 import serial
@@ -14,6 +14,27 @@ try:
     from ..simulation.mock_serial import MockSerial, get_virtual_device_instance
 except ImportError:
     MockSerial = None
+
+
+# ESP32-S3 USB VID/PIDs - these are common chips used with ESP32-S3
+ESP32_S3_IDENTIFIERS = [
+    # Espressif native USB (ESP32-S3 built-in USB)
+    (0x303A, 0x1001),  # ESP32-S3 CDC
+    (0x303A, 0x0002),  # ESP32-S3 JTAG
+    (0x303A, 0x80D1),  # ESP32-S3 alternate
+    # Common USB-to-Serial bridge chips
+    (0x10C4, 0xEA60),  # Silicon Labs CP210x
+    (0x10C4, 0xEA70),  # Silicon Labs CP2105
+    (0x1A86, 0x7523),  # CH340/CH341
+    (0x1A86, 0x55D4),  # CH9102
+    (0x1A86, 0x55D3),  # CH9102F
+    (0x0403, 0x6001),  # FTDI FT232R
+    (0x0403, 0x6010),  # FTDI FT2232
+    (0x0403, 0x6015),  # FTDI FT231X
+    (0x2341, 0x0043),  # Arduino Uno
+    (0x2341, 0x0001),  # Arduino Mega
+    (0x239A, None),    # Adafruit (any PID)
+]
 
 
 class SerialManager:
@@ -38,31 +59,47 @@ class SerialManager:
         #     self.receive_thread.start()
 
     def connect(self):
-        """Connect to ESP32 serial port"""
+        """Connect to ESP32/ESP32-S3 serial port"""
         try:
             if self.port == 'AUTO':
-                # Auto-detect ESP32 port
+                # Auto-detect ESP32/ESP32-S3 port with improved detection
                 ports = serial.tools.list_ports.comports()
                 esp32_port = None
                 if not ports:
-                    print("[ERROR] No serial ports detected - is the ESP32 connected?")
+                    print("[ERROR] No serial ports detected - is the ESP32-S3 connected?")
                     self.last_error = "No serial ports detected"
                     return False
 
                 print("[INFO] Available serial ports:")
                 for port in ports:
-                    print(f"   - {port.device}: {port.description}")
+                    vid_pid = f"VID:0x{port.vid:04X} PID:0x{port.pid:04X}" if port.vid else "No VID/PID"
+                    print(f"   - {port.device}: {port.description} ({vid_pid})")
 
-                keywords = ("cp210", "ch340", "usb", "silicon", "uart", "esp32", "wch", "ftdi")
+                # First pass: Check VID/PID for known ESP32-S3 chips
                 for port in ports:
-                    desc_lower = port.description.lower() if port.description else ""
-                    hwid_lower = port.hwid.lower() if getattr(port, "hwid", None) else ""
-                    if any(keyword in desc_lower or keyword in hwid_lower for keyword in keywords):
-                        esp32_port = port.device
+                    if port.vid and port.pid:
+                        for vid, pid in ESP32_S3_IDENTIFIERS:
+                            if port.vid == vid and (pid is None or port.pid == pid):
+                                esp32_port = port.device
+                                print(f"[OK] ESP32-S3 detected via VID/PID on {esp32_port}")
+                                break
+                    if esp32_port:
                         break
+
+                # Second pass: Check description keywords if VID/PID didn't match
+                if not esp32_port:
+                    keywords = ("cp210", "ch340", "ch910", "usb", "silicon", "uart", "esp32", "wch", "ftdi", "serial")
+                    for port in ports:
+                        desc_lower = port.description.lower() if port.description else ""
+                        hwid_lower = port.hwid.lower() if getattr(port, "hwid", None) else ""
+                        if any(keyword in desc_lower or keyword in hwid_lower for keyword in keywords):
+                            esp32_port = port.device
+                            print(f"[OK] ESP32-S3 detected via description on {esp32_port}")
+                            break
+                            
                 if not esp32_port:
                     esp32_port = ports[0].device
-                    print(f"[WARN] No known ESP32 bridge detected. Falling back to {esp32_port}. "
+                    print(f"[WARN] No known ESP32-S3 bridge detected. Falling back to {esp32_port}. "
                           "Set config['led_serial_port'] to override.")
                 self.port = esp32_port
 
