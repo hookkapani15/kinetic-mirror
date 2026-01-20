@@ -53,69 +53,60 @@ class BodySegmenter:
         
         # Temporal smoothing buffers
         self.mask_buffer = None
-        self.smoothing = 0.25  # Lower = more responsive, Higher = smoother
+        self.smoothing = 0.10  # LOWER = more snappy/crisp, higher = smoother/more lag
         
         # Morphology kernels (pre-computed for speed)
         self.kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-        self.kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         self.kernel_dilate = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         
     def get_body_mask(self, frame):
         """
-        Extract clean body silhouette optimized for LED display
+        Extract clean body silhouette with performance optimizations
         Returns binary mask (0 or 255)
         """
         self.frame_count += 1
+        h, w = frame.shape[:2]
         
-        # Convert to RGB for MediaPipe
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+        # PERFORMANCE: Processing at lower resolution significantly reduces lag
+        proc_w, proc_h = 256, 144
+        small_rgb = cv2.resize(frame, (proc_w, proc_h), interpolation=cv2.INTER_LINEAR)
+        small_rgb = cv2.cvtColor(small_rgb, cv2.COLOR_BGR2RGB)
+        
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=small_rgb)
         
         # Run segmentation
         timestamp_ms = int(self.frame_count * 33)
         result = self.segmenter.segment_for_video(mp_image, timestamp_ms)
         
         if result.category_mask is None:
-            return np.zeros((frame.shape[0], frame.shape[1]), dtype=np.uint8)
+            return np.zeros((h, w), dtype=np.uint8)
         
-        # Get raw mask
+        # Get raw mask at processing resolution
         mask = result.category_mask.numpy_view()
         mask = (mask > 0).astype(np.float32)
         
-        # Temporal smoothing to reduce flicker
+        # Temporal smoothing at low res (faster)
         if self.mask_buffer is None:
             self.mask_buffer = mask.copy()
         else:
-            # Exponential moving average
             self.mask_buffer = self.smoothing * self.mask_buffer + (1.0 - self.smoothing) * mask
         
-        # Threshold to binary (0.4 threshold catches more of the body)
         binary = (self.mask_buffer > 0.4).astype(np.uint8) * 255
         
-        # === MORPHOLOGY PIPELINE FOR CLEAN SILHOUETTE ===
-        
-        # 1. Close: Fill small holes inside body
+        # Faster Morphology at lower resolution
         binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, self.kernel_close)
         
-        # 2. Fill ALL holes inside contours (solid body)
+        # Solidify (Fast at low res)
         contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if contours:
-            # Keep only largest contour (the person)
             largest = max(contours, key=cv2.contourArea)
             binary = np.zeros_like(binary)
             cv2.drawContours(binary, [largest], -1, 255, cv2.FILLED)
         
-        # 3. Open: Remove small noise/artifacts
-        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, self.kernel_open)
-        
-        # 4. Slight dilation to ensure full body coverage
         binary = cv2.dilate(binary, self.kernel_dilate, iterations=1)
         
-        # 5. Gaussian blur + threshold for smooth edges
-        binary = cv2.GaussianBlur(binary, (5, 5), 0)
-        binary = (binary > 128).astype(np.uint8) * 255
-        
-        return binary
+        # Upscale mask back to original size for UI/matching
+        return cv2.resize(binary, (w, h), interpolation=cv2.INTER_NEAREST)
     
     def get_led_mask(self, frame, led_width=32, led_height=64):
         """
