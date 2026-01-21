@@ -9,6 +9,7 @@ from tkinter import ttk, messagebox
 import time
 import math
 import threading
+import random
 import serial
 import serial.tools.list_ports
 import cv2
@@ -17,7 +18,6 @@ import numpy as np
 import subprocess
 import os
 import sys
-from PIL import Image, ImageTk
 
 # Try to import MediaPipe for body tracking
 MEDIAPIPE_AVAILABLE = False
@@ -100,14 +100,12 @@ PARTITIONS_BIN = PARTITIONS_BIN_ESP32
 
 class BodySegmenter:
     """
-    Optimized body segmentation from LED Branch (Secret Sauce)
-    - Clean silhouette extraction
-    - Temporal smoothing (reduces flicker)
-    - Hole filling (solid body)
-    - Edge smoothing
+    Optimized body segmentation - balances speed and detection quality.
+    - Moderate processing resolution for reliable detection
+    - Light temporal smoothing to reduce flicker
+    - Fast morphology for clean edges
     """
     def __init__(self):
-        # Local imports to avoid global dependency issues if not used
         import mediapipe as mp
         from mediapipe.tasks import python as mp_python
         from mediapipe.tasks.python import vision as mp_vision
@@ -122,7 +120,6 @@ class BodySegmenter:
         if not model_path.exists():
             print("Downloading segmentation model...")
             url = "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/latest/selfie_segmenter.tflite"
-            # Bypass SSL for robust download
             ctx = ssl.create_default_context()
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
@@ -139,63 +136,55 @@ class BodySegmenter:
         self.segmenter = mp_vision.ImageSegmenter.create_from_options(options)
         self.frame_count = 0
         
-        # Temporal smoothing buffers
+        # Light temporal smoothing for stability
         self.mask_buffer = None
-        self.smoothing = 0.10  # LOWER = more snappy/crisp, higher = smoother/more lag
+        self.smoothing = 0.15  # Light smoothing - 15% old, 85% new
         
-        # Morphology kernels (pre-computed for speed)
+        # Morphology kernels
         self.kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-        self.kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         self.kernel_dilate = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         
     def get_body_mask(self, frame):
         """
-        Extract clean body silhouette with performance optimizations
+        Body mask extraction with good detection quality.
         Returns binary mask (0 or 255)
         """
         self.frame_count += 1
         h, w = frame.shape[:2]
         
-        # PERFORMANCE: Processing at lower resolution significantly reduces lag
-        # model usually takes 256x256, so processing at that size is fine
-        proc_w, proc_h = 256, 144 # 16:9 ratio approximately
-        small_rgb = cv2.resize(frame, (proc_w, proc_h), interpolation=cv2.INTER_LINEAR)
-        small_rgb = cv2.cvtColor(small_rgb, cv2.COLOR_BGR2RGB)
+        # Process at moderate resolution for reliable detection
+        proc_w, proc_h = 256, 192
+        
+        small = cv2.resize(frame, (proc_w, proc_h), interpolation=cv2.INTER_LINEAR)
+        small_rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
         
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=small_rgb)
         
-        # Run segmentation
+        # Run segmentation  
         timestamp_ms = int(self.frame_count * 33)
         result = self.segmenter.segment_for_video(mp_image, timestamp_ms)
         
         if result.category_mask is None:
             return np.zeros((h, w), dtype=np.uint8)
         
-        # Get raw mask at processing resolution
+        # Get mask as float for smoothing
         mask = result.category_mask.numpy_view()
-        mask = (mask > 0).astype(np.float32)
+        mask_float = (mask > 0).astype(np.float32)
         
-        # Temporal smoothing at low res (faster)
+        # Light temporal smoothing
         if self.mask_buffer is None:
-            self.mask_buffer = mask.copy()
+            self.mask_buffer = mask_float.copy()
         else:
-            self.mask_buffer = self.smoothing * self.mask_buffer + (1.0 - self.smoothing) * mask
+            self.mask_buffer = self.smoothing * self.mask_buffer + (1.0 - self.smoothing) * mask_float
         
+        # Convert to binary
         binary = (self.mask_buffer > 0.4).astype(np.uint8) * 255
         
-        # Faster Morphology at lower resolution
+        # Morphology to clean up and fill holes
         binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, self.kernel_close)
-        
-        # Solifidy (Fast at low res)
-        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if contours:
-            largest = max(contours, key=cv2.contourArea)
-            binary = np.zeros_like(binary)
-            cv2.drawContours(binary, [largest], -1, 255, cv2.FILLED)
-        
         binary = cv2.dilate(binary, self.kernel_dilate, iterations=1)
         
-        # Upscale mask back to original size for display/matching
+        # Upscale to camera frame size
         return cv2.resize(binary, (w, h), interpolation=cv2.INTER_NEAREST)
 
     def close(self):
@@ -281,188 +270,197 @@ class ModernButton(tk.Canvas):
         self._draw()
 
 
+class BodyGridVisualizer(tk.Canvas):
+    """Simple 8x8 grid showing body silhouette - cells light up where body is detected"""
+    def __init__(self, parent, **kwargs):
+        super().__init__(parent, bg=COLORS['bg_dark'], highlightthickness=0, **kwargs)
+        self.motor_angles = [0] * 64
+        self.motor_active = [False] * 64
+        self._cell_ids = []
+        self._items_created = False
+        self.bind('<Configure>', self._on_resize)
+    
+    def _on_resize(self, event):
+        self._items_created = False
+        self._draw_grid()
+    
+    def update_angles(self, angles):
+        """Update which cells are active based on motor angles"""
+        if len(angles) >= 64:
+            for i in range(64):
+                self.motor_active[i] = angles[i] > 90
+                self.motor_angles[i] = angles[i]
+        self._update_cells()
+    
+    def _draw_grid(self):
+        """Draw simple 8x8 colored grid"""
+        self.delete('all')
+        self._cell_ids = []
+        
+        w = self.winfo_width()
+        h = self.winfo_height()
+        
+        if w < 20 or h < 20:
+            return
+        
+        margin = 3
+        grid_size = min(w, h) - margin * 2
+        cell_size = grid_size / 8
+        
+        start_x = (w - grid_size) / 2
+        start_y = (h - grid_size) / 2
+        
+        for i in range(64):
+            row = i // 8
+            col = i % 8
+            
+            x1 = start_x + col * cell_size
+            y1 = start_y + row * cell_size
+            x2 = x1 + cell_size - 1
+            y2 = y1 + cell_size - 1
+            
+            color = COLORS['success'] if self.motor_active[i] else '#1a1a2e'
+            cell_id = self.create_rectangle(x1, y1, x2, y2, 
+                                           fill=color, outline='#333344', width=1)
+            self._cell_ids.append(cell_id)
+        
+        self._items_created = True
+    
+    def _update_cells(self):
+        if not self._items_created or len(self._cell_ids) < 64:
+            self._draw_grid()
+            return
+        
+        for i in range(64):
+            color = COLORS['success'] if self.motor_active[i] else '#1a1a2e'
+            self.itemconfig(self._cell_ids[i], fill=color)
+
+
 class MotorVisualizer(tk.Canvas):
-    """Beautiful 8x8 motor grid visualization - optimized to prevent flickering"""
+    """Compact 8x8 motor simulation with servo horns"""
     def __init__(self, parent, **kwargs):
         super().__init__(parent, bg=COLORS['bg_dark'], highlightthickness=0, **kwargs)
         self.motor_angles = [90] * 64
         self.motor_active = [False] * 64
-        self.cell_size = 55
+        self._items = {}
         self._items_created = False
-        self._motor_items = {}  # Cache canvas item IDs
         self.bind('<Configure>', self._on_resize)
     
     def _on_resize(self, event):
-        margin = 60
-        available_w = event.width - margin * 2
-        available_h = event.height - margin * 2
-        self.cell_size = min(available_w // 8, available_h // 8)
-        self._items_created = False  # Force redraw on resize
-        self.draw_motors()
+        self._items_created = False
+        self._draw()
     
     def update_angles(self, angles):
-        """Update motor angles and redraw"""
         if len(angles) >= 64:
             for i in range(64):
-                new_angle = angles[i]
-                self.motor_active[i] = abs(new_angle - 90) > 5
-                self.motor_angles[i] = new_angle
-        self._update_motor_positions()
+                self.motor_active[i] = angles[i] > 90
+                self.motor_angles[i] = angles[i]
+        self._update()
     
-    def _update_motor_positions(self):
-        """Update only the horn positions without recreating items"""
-        if not self._items_created:
-            self.draw_motors()
-            return
-        
-        w = self.winfo_width()
-        h = self.winfo_height()
-        
-        if w < 100 or h < 100:
-            return
-        
-        margin_x = 40
-        margin_y = 40
-        grid_w = w - margin_x * 2
-        grid_h = h - margin_y * 2
-        cell_w = grid_w / 8
-        cell_h = grid_h / 8
-        size = cell_w * 0.38
-        r = size * 0.6
-        horn_length = r * 1.3
-        
-        for i in range(64):
-            row = i // 8
-            col = i % 8
-            
-            cx = margin_x + col * cell_w + cell_w/2
-            cy = margin_y + row * cell_h + cell_h/2
-            
-            angle = self.motor_angles[i]
-            active = self.motor_active[i]
-            
-            rad = math.radians(180 - angle)
-            end_x = cx + horn_length * math.cos(rad)
-            end_y = cy - horn_length * math.sin(rad)
-            
-            # Update colors and positions
-            body_color = COLORS['motor_active'] if active else COLORS['motor_body']
-            outline_color = COLORS['accent_secondary'] if active else COLORS['motor_neutral']
-            horn_color = COLORS['motor_horn'] if active else '#888888'
-            
-            if f'body_{i}' in self._motor_items:
-                self.itemconfig(self._motor_items[f'body_{i}'], fill=body_color, outline=outline_color)
-                self.itemconfig(self._motor_items[f'inner_{i}'], outline=outline_color)
-                self.coords(self._motor_items[f'horn_{i}'], cx, cy, end_x, end_y)
-                self.itemconfig(self._motor_items[f'horn_{i}'], fill=horn_color)
-                
-                tip_r = 3
-                self.coords(self._motor_items[f'tip_{i}'], end_x - tip_r, end_y - tip_r, end_x + tip_r, end_y + tip_r)
-                self.itemconfig(self._motor_items[f'tip_{i}'], fill=horn_color)
-                
-                # Update angle text
-                if active:
-                    self.itemconfig(self._motor_items[f'angle_{i}'], text=f"{int(angle)}°", 
-                                   fill=COLORS['accent_secondary'])
-                else:
-                    self.itemconfig(self._motor_items[f'angle_{i}'], text="")
-    
-    def draw_motors(self):
-        """Draw the 8x8 motor grid - creates items once"""
+    def _draw(self):
         self.delete('all')
-        self._motor_items = {}
+        self._items = {}
         
         w = self.winfo_width()
         h = self.winfo_height()
         
-        if w < 100 or h < 100:
+        if w < 40 or h < 40:
             return
         
-        margin_x = 40
-        margin_y = 40
-        grid_w = w - margin_x * 2
-        grid_h = h - margin_y * 2
-        cell_w = grid_w / 8
-        cell_h = grid_h / 8
+        margin = 3
+        grid_size = min(w, h) - margin * 2
+        cell_size = grid_size / 8
         
-        # Draw title
-        self.create_text(w/2, 15, text="🔧 64 SERVO MOTORS", 
-                        fill=COLORS['text_primary'], font=('Segoe UI', 12, 'bold'))
+        start_x = (w - grid_size) / 2
+        start_y = (h - grid_size) / 2
         
-        # Draw column headers
-        for col in range(8):
-            x = margin_x + col * cell_w + cell_w/2
-            self.create_text(x, margin_y - 12, text=str(col + 1), 
-                           fill=COLORS['text_secondary'], font=('Segoe UI', 8))
-        
-        # Draw row headers
-        row_labels = 'ABCDEFGH'
-        for row in range(8):
-            y = margin_y + row * cell_h + cell_h/2
-            self.create_text(margin_x - 15, y, text=row_labels[row], 
-                           fill=COLORS['text_secondary'], font=('Segoe UI', 8))
-        
-        # Draw motors with cached item IDs
-        size = cell_w * 0.38
         for i in range(64):
             row = i // 8
             col = i % 8
             
-            cx = margin_x + col * cell_w + cell_w/2
-            cy = margin_y + row * cell_h + cell_h/2
+            cx = start_x + col * cell_size + cell_size / 2
+            cy = start_y + row * cell_size + cell_size / 2
             
-            self._create_servo(cx, cy, i, self.motor_angles[i], self.motor_active[i], size)
+            r = cell_size * 0.35
+            active = self.motor_active[i]
+            angle = self.motor_angles[i]
+            
+            # Motor body
+            body_color = COLORS['motor_active'] if active else '#2a2a3a'
+            self._items[f'body_{i}'] = self.create_oval(
+                cx - r, cy - r, cx + r, cy + r,
+                fill=body_color, outline='#444455', width=1
+            )
+            
+            # Horn
+            horn_len = r * 1.2
+            rad = math.radians(180 - angle)
+            ex = cx + horn_len * math.cos(rad)
+            ey = cy - horn_len * math.sin(rad)
+            
+            horn_color = COLORS['success'] if active else '#555566'
+            self._items[f'horn_{i}'] = self.create_line(
+                cx, cy, ex, ey, fill=horn_color, width=2
+            )
         
         self._items_created = True
     
-    def _create_servo(self, cx, cy, index, angle, active, size):
-        """Create a single SG90-style servo motor with cached items"""
-        body_color = COLORS['motor_active'] if active else COLORS['motor_body']
-        outline_color = COLORS['accent_secondary'] if active else COLORS['motor_neutral']
+    def _update(self):
+        if not self._items_created:
+            self._draw()
+            return
         
-        r = size * 0.6
+        w = self.winfo_width()
+        h = self.winfo_height()
         
-        # Body
-        self._motor_items[f'body_{index}'] = self.create_oval(
-            cx - r, cy - r, cx + r, cy + r, 
-            fill=body_color, outline=outline_color, width=2
-        )
+        if w < 40 or h < 40:
+            return
         
-        # Inner circle
-        inner_r = r * 0.4
-        self._motor_items[f'inner_{index}'] = self.create_oval(
-            cx - inner_r, cy - inner_r, cx + inner_r, cy + inner_r,
-            fill=COLORS['bg_light'], outline=outline_color, width=1
-        )
+        margin = 3
+        grid_size = min(w, h) - margin * 2
+        cell_size = grid_size / 8
         
-        # Horn
-        horn_length = r * 1.3
-        rad = math.radians(180 - angle)
-        end_x = cx + horn_length * math.cos(rad)
-        end_y = cy - horn_length * math.sin(rad)
+        start_x = (w - grid_size) / 2
+        start_y = (h - grid_size) / 2
         
-        horn_color = COLORS['motor_horn'] if active else '#888888'
-        
-        self._motor_items[f'horn_{index}'] = self.create_line(
-            cx, cy, end_x, end_y, fill=horn_color, width=2, capstyle='round'
-        )
-        
-        # Tip
-        tip_r = 3
-        self._motor_items[f'tip_{index}'] = self.create_oval(
-            end_x - tip_r, end_y - tip_r, end_x + tip_r, end_y + tip_r,
-            fill=horn_color, outline=''
-        )
-        
-        # Angle text (empty initially if neutral)
-        self._motor_items[f'angle_{index}'] = self.create_text(
-            cx, cy + r + 10, text=f"{int(angle)}°" if active else "", 
-            fill=COLORS['accent_secondary'], font=('Segoe UI', 7, 'bold')
-        )
+        for i in range(64):
+            row = i // 8
+            col = i % 8
+            
+            cx = start_x + col * cell_size + cell_size / 2
+            cy = start_y + row * cell_size + cell_size / 2
+            
+            r = cell_size * 0.35
+            active = self.motor_active[i]
+            angle = self.motor_angles[i]
+            
+            # Update body color
+            body_color = COLORS['motor_active'] if active else '#2a2a3a'
+            if f'body_{i}' in self._items:
+                self.itemconfig(self._items[f'body_{i}'], fill=body_color)
+            
+            # Update horn
+            horn_len = r * 1.2
+            rad = math.radians(180 - angle)
+            ex = cx + horn_len * math.cos(rad)
+            ey = cy - horn_len * math.sin(rad)
+            
+            horn_color = COLORS['success'] if active else '#555566'
+            if f'horn_{i}' in self._items:
+                self.coords(self._items[f'horn_{i}'], cx, cy, ex, ey)
+                self.itemconfig(self._items[f'horn_{i}'], fill=horn_color)
+    
+    def draw_motors(self):
+        self._draw()
 
 
 class CameraPanel(tk.Frame):
-    """Live camera feed panel with body tracking"""
+    """Live camera feed panel with body tracking - HIGH PERFORMANCE VERSION"""
+    
+    # Processing resolution (lower = faster, but less detail)
+    PROC_WIDTH = 320
+    PROC_HEIGHT = 240
+    
     def __init__(self, parent, on_angle_change=None, **kwargs):
         super().__init__(parent, bg=COLORS['bg_dark'], **kwargs)
         self.on_angle_change = on_angle_change
@@ -470,8 +468,22 @@ class CameraPanel(tk.Frame):
         self.running = False
         self.current_camera = None
         self.body_segmenter = None
-        self.body_x = 0.5  # Normalized body position (0-1)
+        self.body_x = 0.5
         self.body_detected = False
+        
+        # Thread-safe queues for dual-pipeline architecture
+        import queue
+        self._frame_queue = queue.Queue(maxsize=2)  # For display (always fresh)
+        self._seg_queue = queue.Queue(maxsize=2)    # For segmentation (can lag)
+        self._display_scheduled = False
+        
+        # Shared state between threads
+        self._last_seg_mask = None  # Last segmentation result for overlay
+        self._last_imgtk = None     # Keep reference to prevent GC
+        self.tracking_sync_mode = False
+        self.tracking_invert = False
+        self.on_detection_change = None # New callback for silhouette only
+        
         self._create_widgets()
         self._detect_cameras()
         self.after(300, self._auto_start_camera)
@@ -548,13 +560,11 @@ class CameraPanel(tk.Frame):
             if cap.isOpened():
                 ret, frame = cap.read()
                 if ret and frame is not None:
-                    # Get camera name if possible
                     cameras.append(f"Camera {i}")
                 cap.release()
         
         if cameras:
             self.camera_combo['values'] = cameras
-            # Default to camera 1 if available (external), else 0
             if len(cameras) > 1:
                 self.camera_combo.set(cameras[1])
             else:
@@ -582,30 +592,31 @@ class CameraPanel(tk.Frame):
             messagebox.showwarning("No Camera", "No cameras detected!")
             return
         
-        # Extract camera index
         try:
             cam_idx = int(cam_str.split()[-1])
         except:
             cam_idx = 0
         
-        # Try to open camera with backends if needed
+        # Open camera with DirectShow for Windows (faster)
         self.cap = cv2.VideoCapture(cam_idx, cv2.CAP_DSHOW)
         if not self.cap.isOpened():
-            self.cap = cv2.VideoCapture(cam_idx) # Default backend
+            self.cap = cv2.VideoCapture(cam_idx)
             
         if not self.cap.isOpened():
             print(f"❌ Failed to open camera {cam_idx}")
             messagebox.showerror("Camera Error", f"Failed to open camera {cam_idx}")
             return
         
-        # Set resolution
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        # PERFORMANCE: Set camera to capture at processing resolution directly
+        # This avoids expensive resize operations
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.PROC_WIDTH)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.PROC_HEIGHT)
         self.cap.set(cv2.CAP_PROP_FPS, 30)
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Minimize buffer delay
         
-        print(f"📸 Camera {cam_idx} opened successfully")
+        print(f"📸 Camera {cam_idx} opened at {self.PROC_WIDTH}x{self.PROC_HEIGHT}")
         
-        # Initialize BodySegmenter (The Secret Sauce)
+        # Initialize BodySegmenter
         try:
             print("⏳ Initializing BodySegmenter...")
             self.body_segmenter = BodySegmenter()
@@ -616,19 +627,47 @@ class CameraPanel(tk.Frame):
             traceback.print_exc()
             self.body_segmenter = None
         
+        # Clear queues
+        while not self._frame_queue.empty():
+            try:
+                self._frame_queue.get_nowait()
+            except:
+                pass
+        while not self._seg_queue.empty():
+            try:
+                self._seg_queue.get_nowait()
+            except:
+                pass
+        
+        # Reset shared state
+        self._last_seg_mask = None
+        
         self.running = True
+        self._display_scheduled = False
+        
         self.start_btn.text = "⏹ Stop"
         self.start_btn.default_bg = COLORS['error']
         self.start_btn.current_bg = COLORS['error']
         self.start_btn._draw()
         
-        # Start capture thread
+        # Start capture thread (reads camera, feeds both queues)
         print("🧵 Starting capture thread...")
         threading.Thread(target=self._capture_loop, daemon=True).start()
+        
+        # Start segmentation thread (processes frames for motor control)
+        print("🧵 Starting segmentation thread...")
+        threading.Thread(target=self._segmentation_loop, daemon=True).start()
+        
+        # Start display update loop (runs on main thread via after())
+        self._schedule_display_update()
     
     def _stop_camera(self):
         """Stop camera capture"""
         self.running = False
+        self._display_scheduled = False
+        
+        # Wait for threads to finish
+        time.sleep(0.2)
         
         if self.cap:
             self.cap.release()
@@ -637,6 +676,18 @@ class CameraPanel(tk.Frame):
         if self.body_segmenter:
             self.body_segmenter.close()
             self.body_segmenter = None
+        
+        # Clear queues
+        while not self._frame_queue.empty():
+            try:
+                self._frame_queue.get_nowait()
+            except:
+                pass
+        while not self._seg_queue.empty():
+            try:
+                self._seg_queue.get_nowait()
+            except:
+                pass
         
         self.start_btn.text = "▶ Start"
         self.start_btn.default_bg = COLORS['success']
@@ -648,6 +699,10 @@ class CameraPanel(tk.Frame):
         
         # Clear canvas
         self.video_canvas.delete('all')
+        if hasattr(self, '_canvas_img_id'):
+            delattr(self, '_canvas_img_id')
+        self._last_imgtk = None
+        
         self.video_canvas.create_text(
             self.video_canvas.winfo_width() // 2,
             self.video_canvas.winfo_height() // 2,
@@ -657,147 +712,240 @@ class CameraPanel(tk.Frame):
         )
     
     def _capture_loop(self):
-        """Main camera capture loop - Powered by BodySegmenter (New API)"""
-        frame_count = 0
+        """
+        ZERO-LAG capture loop:
+        - Only reads camera and puts frames in queues
+        - NO processing here - display and segmentation run in parallel
+        - This loop runs as fast as the camera allows
+        """
         while self.running and self.cap:
             try:
                 ret, frame = self.cap.read()
                 if not ret or frame is None:
-                    frame_count += 1
                     continue
-                
-                frame_count += 1
                 
                 # Flip for mirror effect
                 frame = cv2.flip(frame, 1)
-                h, w = frame.shape[:2]
                 
-                # Process with BodySegmenter (Robust)
-                self.body_detected = False
-                h, w = frame.shape[:2]
+                # Put frame in DISPLAY queue (always, for smooth video)
+                try:
+                    # Clear old frame if queue is full (keep only latest)
+                    if self._frame_queue.full():
+                        try:
+                            self._frame_queue.get_nowait()
+                        except:
+                            pass
+                    self._frame_queue.put_nowait(frame.copy())
+                except:
+                    pass
                 
-                if self.body_segmenter:
-                    # Get robust binary mask (0 or 255)
-                    seg_mask = self.body_segmenter.get_body_mask(frame)
+                # Put frame in SEGMENTATION queue (for motor control)
+                try:
+                    # Clear old frame if queue is full (keep only latest)
+                    if self._seg_queue.full():
+                        try:
+                            self._seg_queue.get_nowait()
+                        except:
+                            pass
+                    self._seg_queue.put_nowait(frame)
+                except:
+                    pass
                     
-                    # Check if body present (> 0.5% of pixels)
-                    # seg_mask is 0 or 255.
-                    if np.sum(seg_mask) > (w * h * 0.005 * 255):
-                        self.body_detected = True
-                else:
-                    seg_mask = np.zeros((h, w), dtype=np.uint8)
-                    self.body_detected = False
-
-                if self.body_detected:
-                     # Resize mask to 8x8 for the servo grid
-                     # Use INTER_AREA for better downsampling (averaging) - prevents flickering
-                     mask_8x8 = cv2.resize(seg_mask, (8, 8), interpolation=cv2.INTER_AREA)
-                     
-                     # Create 64-element angle array directly from mask
-                     # Human (mask > 50) -> 180 degrees (Active)
-                     # Background -> 0 degrees (Inactive)
-                     angles = []
-                     for row in range(8):
-                         for col in range(8):
-                             val = mask_8x8[row, col]
-                             angle = 180 if val > 50 else 0
-                             angles.append(angle)
-                     
-                     # Send directly to motors
-                     if self.on_angle_change:
-                         self.on_angle_change(angles)
-                         
-                     # VISUALIZATION: Optimized lower-res visualization
-                     # Do tinting at 320x240 for speed
-                     v_h, v_w = 240, 320
-                     small_frame = cv2.resize(frame, (v_w, v_h), interpolation=cv2.INTER_LINEAR)
-                     small_mask = cv2.resize(seg_mask, (v_w, v_h), interpolation=cv2.INTER_NEAREST)
-                     
-                     overlay = small_frame.copy()
-                     overlay[small_mask == 0] = (255, 0, 0) # Blue
-                     overlay[small_mask == 255] = (0, 255, 0) # Green
-                     
-                     blended = cv2.addWeighted(overlay, 0.4, small_frame, 0.6, 0)
-                     frame = cv2.resize(blended, (w, h), interpolation=cv2.INTER_LINEAR)
-                     
-                     # Draw 8x8 Grid overlay
-                     h, w = frame.shape[:2]
-                     step_x = w / 8
-                     step_y = h / 8
-                     for r in range(8):
-                         for c in range(8):
-                             if mask_8x8[r, c] > 50:
-                                 # Draw active grid cell outline in Green
-                                 x1 = int(c * step_x)
-                                 y1 = int(r * step_y)
-                                 x2 = int((c + 1) * step_x)
-                                 y2 = int((r + 1) * step_y)
-                                 cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 1)
-                     
-                     # Update body_x for legacy
-                     # Calculate center X
-                     contours, _ = cv2.findContours(seg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                     if contours:
-                         largest = max(contours, key=cv2.contourArea)
-                         x, y, bw, bh = cv2.boundingRect(largest)
-                         self.body_x = (x + bw/2) / w
-                
-                # Draw tracking indicator (Simple text only)
-                if self.body_detected:
-                    cv2.putText(frame, "BODY DETECTED", (10, 30),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                
-                # Only update labels every 10 frames to save UI thread
-                if frame_count % 10 == 0:
-                    self._update_tracking_ui()
-                
-                self._update_canvas(frame)
-            
             except Exception as e:
                 print(f"Capture error: {e}")
-            
-            time.sleep(0.033)
-            
+    
+    def _segmentation_loop(self):
+        """
+        SEPARATE segmentation thread:
+        - Runs body segmentation on frames from queue
+        - Updates motors based on segmentation result
+        - Doesn't block the display at all
+        """
+        # Lower threshold for more sensitive detection (0.1% of pixels)
+        body_threshold = self.PROC_WIDTH * self.PROC_HEIGHT * 0.001 * 255
+        frame_count = 0
+        
+        while self.running:
+            try:
+                # Wait for a frame (with timeout to allow clean shutdown)
+                try:
+                    frame = self._seg_queue.get(timeout=0.1)
+                except:
+                    continue
+                
+                if frame is None:
+                    continue
+                
+                frame_count += 1
+                h, w = frame.shape[:2]
+                
+                # Run segmentation
+                seg_mask = None
+                body_detected = False
+                
+                if self.body_segmenter:
+                    seg_mask = self.body_segmenter.get_body_mask(frame)
+                    mask_sum = np.sum(seg_mask)
+                    
+                    # Debug: print mask sum every 30 frames
+                    if frame_count % 30 == 0:
+                        print(f"[SEG] Mask sum: {mask_sum:.0f}, threshold: {body_threshold:.0f}")
+                    
+                    if mask_sum > body_threshold:
+                        body_detected = True
+                
+                # Update shared state for display
+                self.body_detected = body_detected
+                self._last_seg_mask = seg_mask
+                
+                # 1. ALWAYS calculate the silhouette for the DETECTION grid
+                if seg_mask is not None:
+                    mask_8x8 = cv2.resize(seg_mask, (8, 8), interpolation=cv2.INTER_AREA)
+                    silhouette = (mask_8x8.flatten() > 50).astype(np.uint8) * 180
+                    # Update detection UI independently
+                    if hasattr(self, 'on_detection_change') and self.on_detection_change:
+                        self.on_detection_change(silhouette.tolist())
+
+                # 2. Calculate Motor Angles based on Mode
+                if body_detected and seg_mask is not None:
+                    if getattr(self, 'tracking_sync_mode', False):
+                        # 🔗 Synchronized Movement Mode
+                        # Calculate Center of Gravity (average X)
+                        coords = np.where(seg_mask > 50)
+                        if len(coords[1]) > 0:
+                            x_center = np.mean(coords[1]) / w
+                            
+                            # Apply Invert
+                            if getattr(self, 'tracking_invert', False):
+                                x_center = 1.0 - x_center
+                                
+                            # Convert to angle 0-180
+                            angle = int(x_center * 180)
+                            angle = max(0, min(180, angle))
+                            
+                            # All motors move together
+                            motor_angles = [angle] * 64
+                            if self.on_angle_change:
+                                self.on_angle_change(motor_angles)
+                    else:
+                        # 👤 Independent Silhouette Mode
+                        # Apply Horizontal Flip to mask if Invert is enabled
+                        if getattr(self, 'tracking_invert', False):
+                            mask_8x8 = cv2.flip(mask_8x8, 1)
+                            
+                        motor_angles = (mask_8x8.flatten() > 50).astype(np.uint8) * 180
+                        if self.on_angle_change:
+                            self.on_angle_change(motor_angles.tolist())
+                            
+                elif frame_count % 10 == 0: # Idle reset
+                    if self.on_angle_change:
+                        self.on_angle_change([90] * 64)
+                    if hasattr(self, 'on_detection_change') and self.on_detection_change:
+                        self.on_detection_change([0] * 64)
+                        
+            except Exception as e:
+                print(f"Segmentation error: {e}")
+                import traceback
+                traceback.print_exc()
+
+    def set_tracking_params(self, sync_mode=None, invert=None, smoothing=None):
+        """Update tracking engine parameters at runtime"""
+        if sync_mode is not None:
+            self.tracking_sync_mode = sync_mode
+        if invert is not None:
+            self.tracking_invert = invert
+        if smoothing is not None and self.body_segmenter:
+            self.body_segmenter.smoothing = smoothing
 
     
-    def _update_canvas(self, frame):
-        """Update canvas with new frame (optimized)"""
+    def _schedule_display_update(self):
+        """Schedule the next display update on main thread"""
+        if self.running and not self._display_scheduled:
+            self._display_scheduled = True
+            # Update display at 30 FPS (33ms) for smooth video
+            self.after(33, self._display_update)
+    
+    def _display_update(self):
+        """
+        Display update - raw camera feed only, no processing.
+        """
+        self._display_scheduled = False
+        
+        if not self.running:
+            return
+        
         try:
-            # Get canvas size
+            # Get the LATEST frame only
+            frame = None
+            while not self._frame_queue.empty():
+                try:
+                    frame = self._frame_queue.get_nowait()
+                except:
+                    break
+            
+            if frame is not None:
+                # Add simple "BODY" indicator when detected
+                if self.body_detected:
+                    cv2.putText(frame, "BODY", (10, 20),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                
+                self._render_frame(frame)
+                self._update_tracking_ui_fast(self.body_detected)
+        
+        except Exception as e:
+            print(f"Display error: {e}")
+        
+        # Schedule next update
+        if self.running:
+            self._display_scheduled = True
+            self.after(33, self._display_update)
+    
+    def _render_frame(self, frame):
+        """Render a frame to the canvas (ultra-optimized)"""
+        try:
             canvas_w = self.video_canvas.winfo_width()
             canvas_h = self.video_canvas.winfo_height()
             
             if canvas_w < 10 or canvas_h < 10:
                 return
             
-            # Resize frame to fit canvas
             frame_h, frame_w = frame.shape[:2]
+            
+            # Calculate scale
             scale = min(canvas_w / frame_w, canvas_h / frame_h)
             new_w = int(frame_w * scale)
             new_h = int(frame_h * scale)
             
-            # Using INTER_NEAREST for display resize is much faster
-            resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
-            img = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-            im = Image.fromarray(img)
+            # Resize if needed
+            if new_w != frame_w or new_h != frame_h:
+                display = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
+            else:
+                display = frame
+            
+            # BGR to RGB
+            rgb = cv2.cvtColor(display, cv2.COLOR_BGR2RGB)
+            
+            # Create PhotoImage
+            im = Image.fromarray(rgb)
             imgtk = ImageTk.PhotoImage(image=im)
             
-            if not hasattr(self, '_canvas_img_id'):
+            # Update canvas
+            if hasattr(self, '_canvas_img_id'):
+                self.video_canvas.itemconfig(self._canvas_img_id, image=imgtk)
+            else:
                 self._canvas_img_id = self.video_canvas.create_image(
                     canvas_w // 2, canvas_h // 2, image=imgtk, anchor='center')
-                self._canvas_imgtk = imgtk
-            else:
-                self.video_canvas.itemconfig(self._canvas_img_id, image=imgtk)
-                self._canvas_imgtk = imgtk
+            
+            self._last_imgtk = imgtk
+            
         except Exception as e:
-            print(f"Canvas update error: {e}")
+            print(f"Render error: {e}")
     
-    def _update_tracking_ui(self):
-        """Update tracking status labels"""
+    def _update_tracking_ui_fast(self, body_detected):
+        """Fast tracking UI update"""
         try:
-            if self.body_detected:
+            if body_detected:
                 self.tracking_status.config(text="● Tracking: ON", fg=COLORS['success'])
-                # Convert position to direction
                 if self.body_x < 0.4:
                     direction = "◀ LEFT"
                 elif self.body_x > 0.6:
@@ -810,6 +958,10 @@ class CameraPanel(tk.Frame):
                 self.position_label.config(text="Position: --")
         except:
             pass
+    
+    def _update_tracking_ui(self):
+        """Legacy method"""
+        self._update_tracking_ui_fast(self.body_detected)
     
     def stop(self):
         """Cleanup"""
@@ -1357,10 +1509,11 @@ class ConnectionPanel(tk.Frame):
 
 class ManualControlPanel(tk.Frame):
     """Compact manual control panel"""
-    def __init__(self, parent, on_angle_change=None, **kwargs):
+    def __init__(self, parent, on_angle_change=None, main_log=None, **kwargs):
         super().__init__(parent, bg=COLORS['bg_medium'], **kwargs)
         
         self.on_angle_change = on_angle_change
+        self.main_log = main_log
         self.current_angles = [90] * 64
         
         self._create_widgets()
@@ -1410,6 +1563,67 @@ class ManualControlPanel(tk.Frame):
                                     width=80, height=26,
                                     bg=COLORS['success'])
         self.test_btn.pack(pady=3)
+
+        # ---------------- Verification Suite ----------------
+        tk.Label(self, text="🛡️ VERIFICATION", 
+                 bg=COLORS['bg_medium'], fg=COLORS['text_secondary'],
+                 font=('Segoe UI', 8, 'bold')).pack(pady=(10, 2))
+        
+        v_frame = tk.Frame(self, bg=COLORS['bg_medium'])
+        v_frame.pack(fill='x', padx=5)
+        
+        tk.Button(v_frame, text="Ping Test", command=self._verify_ping,
+                 bg=COLORS['bg_light'], fg='white', bd=0, font=('Segoe UI', 7), pady=3).pack(side='left', expand=True, fill='x', padx=1)
+        tk.Button(v_frame, text="Scan Rows", command=self._verify_scan,
+                 bg=COLORS['bg_light'], fg='white', bd=0, font=('Segoe UI', 7), pady=3).pack(side='left', expand=True, fill='x', padx=1)
+
+    def _log(self, msg):
+        if self.main_log:
+            self.main_log(f"[VERIFY] {msg}")
+        else:
+            print(f"[VERIFY] {msg}")
+
+    def _verify_ping(self):
+        """Quick ping test: Move Motor 0 to verify real-time link"""
+        def run():
+            self._log("Starting Ping Test...")
+            self._log("Sending: Motor 0 -> 180°")
+            angles = [90] * 64
+            angles[0] = 180
+            if self.on_angle_change: self.on_angle_change(angles)
+            time.sleep(0.8)
+            
+            self._log("Sending: Motor 0 -> 0°")
+            angles[0] = 0
+            if self.on_angle_change: self.on_angle_change(angles)
+            time.sleep(0.8)
+            
+            self._log("Sending: Motor 0 -> 90° (Center)")
+            angles[0] = 90
+            if self.on_angle_change: self.on_angle_change(angles)
+            self._log("Ping Test Complete.")
+            
+        threading.Thread(target=run, daemon=True).start()
+
+    def _verify_scan(self):
+        """Scan through rows to verify driver configuration"""
+        def run():
+            self._log("Starting Row Scan...")
+            for row in range(8):
+                self._log(f"Scanning Row {row} (Motors {row*8}-{row*8+7})")
+                angles = [90] * 64
+                for col in range(8):
+                    angles[row*8 + col] = 135
+                if self.on_angle_change: self.on_angle_change(angles)
+                time.sleep(0.5)
+                
+                angles = [90] * 64
+                if self.on_angle_change: self.on_angle_change(angles)
+                time.sleep(0.2)
+            
+            self._log("Row Scan Complete.")
+            
+        threading.Thread(target=run, daemon=True).start()
     
     def _on_slider(self, value):
         angle = int(float(value))
@@ -1521,6 +1735,9 @@ class SimulationVisualizer:
         self.running = True
         self.tracking_enabled = True
         self.control_mode = tk.StringVar(value="Test")  # "Live" or "Test"
+        self.smoothing = 0.15
+        self.mirror_invert = tk.BooleanVar(value=False)
+        self.sync_mode = tk.BooleanVar(value=False)
         self._create_widgets()
         self._update_loop()
     
@@ -1529,103 +1746,197 @@ class SimulationVisualizer:
         style.theme_use('clam')
         style.configure('TCombobox', fieldbackground=COLORS['bg_light'],
                        background=COLORS['bg_light'])
+        
         # Main container
         main = tk.Frame(self.root, bg=COLORS['bg_dark'])
-        main.pack(fill='both', expand=True, padx=8, pady=8)
-        # Header
-        header = tk.Frame(main, bg=COLORS['bg_dark'])
-        header.pack(fill='x', pady=(0, 8))
-        title = tk.Label(header, text="🪞 MOTOR CONTROL SYSTEM", 
-                        bg=COLORS['bg_dark'], fg=COLORS['text_primary'],
-                        font=('Segoe UI', 16, 'bold'))
-        title.pack(side='left')
+        main.pack(fill='both', expand=True, padx=6, pady=6)
+        
+        # ═══════════════════════════════════════════════════════════════
+        # HEADER BAR WITH ALL CONTROLS
+        # ═══════════════════════════════════════════════════════════════
+        header = tk.Frame(main, bg=COLORS['bg_medium'], height=45)
+        header.pack(fill='x', pady=(0, 6))
+        header.pack_propagate(False)
+        
+        # Logo/Title
+        tk.Label(header, text="🪞 MIRROR MOTOR CONTROL", 
+                bg=COLORS['bg_medium'], fg=COLORS['text_primary'],
+                font=('Segoe UI', 13, 'bold')).pack(side='left', padx=10, pady=8)
+        
         # Mode selector
-        mode_frame = tk.Frame(header, bg=COLORS['bg_dark'])
-        mode_frame.pack(side='right', padx=10)
-        tk.Label(mode_frame, text="Mode:", bg=COLORS['bg_dark'], fg=COLORS['text_secondary'], font=('Segoe UI', 10)).pack(side='left')
-        mode_combo = ttk.Combobox(mode_frame, textvariable=self.control_mode, values=["Live", "Test"], state='readonly', width=7)
+        mode_frame = tk.Frame(header, bg=COLORS['bg_medium'])
+        mode_frame.pack(side='left', padx=15)
+        
+        tk.Label(mode_frame, text="Mode:", bg=COLORS['bg_medium'], 
+                fg=COLORS['text_secondary'], font=('Segoe UI', 9)).pack(side='left')
+        
+        mode_combo = ttk.Combobox(mode_frame, textvariable=self.control_mode, 
+                                  values=["Live", "Test"], state='readonly', width=6)
         mode_combo.pack(side='left', padx=4)
         mode_combo.bind('<<ComboboxSelected>>', self._on_mode_change)
-        self.mode_label = tk.Label(mode_frame, text="[ LIVE ]", 
-                                   bg=COLORS['bg_dark'], fg=COLORS['success'],
-                                   font=('Segoe UI', 10))
+        
+        self.mode_label = tk.Label(mode_frame, text="● LIVE", 
+                                   bg=COLORS['bg_medium'], fg=COLORS['success'],
+                                   font=('Segoe UI', 10, 'bold'))
         self.mode_label.pack(side='left', padx=8)
         
         # Diagram button
-        diagram_btn = ModernButton(mode_frame, text="📊 Diagram", 
+        diagram_btn = ModernButton(header, text="📊 Wiring", 
                                    command=self._show_wiring_diagram,
-                                   width=100, height=28,
+                                   width=90, height=28,
                                    bg=COLORS['accent_secondary'])
-        diagram_btn.pack(side='left', padx=8)
-        # Content - 3 columns
-        content = tk.Frame(main, bg=COLORS['bg_dark'])
-        content.pack(fill='both', expand=True)
-        # Left: Camera (largest)
-        self.camera_panel = CameraPanel(content, on_angle_change=self._on_angle_change)
-        self.camera_panel.pack(side='left', fill='both', expand=True, padx=(0, 8))
-        # Right side panel
-        right_panel = tk.Frame(content, bg=COLORS['bg_dark'], width=380)
-        right_panel.pack(side='right', fill='y')
-        right_panel.pack_propagate(False)
-        # Controls (bottom right)
-        controls_frame = tk.Frame(right_panel, bg=COLORS['bg_dark'])
-        controls_frame.pack(side='bottom', fill='x')
+        diagram_btn.pack(side='left', padx=10)
         
-        # Motor visualization (top right)
-        motor_frame = tk.Frame(right_panel, bg=COLORS['bg_dark'])
-        motor_frame.pack(side='top', fill='both', expand=True, pady=(0, 8))
-        self.motor_viz = MotorVisualizer(motor_frame)
-        self.motor_viz.pack(fill='both', expand=True)
-        # Connection panel - main_log will be set after _create_widgets
-        self.connection_panel = ConnectionPanel(
-            controls_frame, 
-            on_connect=self._on_connect,
-            on_disconnect=self._on_disconnect,
-            main_log=lambda msg: self._log(msg) if hasattr(self, 'log_text') else print(msg)
-        )
-        self.connection_panel.pack(side='left', fill='y', padx=(0, 8))
-        # Manual control panel
-        self.control_panel = ManualControlPanel(
-            controls_frame,
-            on_angle_change=self._on_angle_change
-        )
-        self.control_panel.pack(side='left', fill='y')
+        # Status indicators (right side)
+        status_frame = tk.Frame(header, bg=COLORS['bg_medium'])
+        status_frame.pack(side='right', padx=10)
         
-        # LIVE LOG PANEL - shows all system events
-        log_frame = tk.Frame(main, bg=COLORS['bg_medium'])
-        log_frame.pack(fill='x', pady=(8, 0))
+        mp_status = "✓ MediaPipe" if MEDIAPIPE_AVAILABLE else "✗ MediaPipe"
+        mp_color = COLORS['success'] if MEDIAPIPE_AVAILABLE else COLORS['error']
+        tk.Label(status_frame, text=mp_status, bg=COLORS['bg_medium'], fg=mp_color,
+                font=('Segoe UI', 9)).pack(side='right', padx=5)
         
-        log_header = tk.Frame(log_frame, bg=COLORS['bg_medium'])
-        log_header.pack(fill='x')
-        tk.Label(log_header, text="📋 SYSTEM LOG", bg=COLORS['bg_medium'], fg=COLORS['text_primary'],
-                font=('Segoe UI', 9, 'bold')).pack(side='left', padx=10, pady=4)
-        
-        # Clear log button
-        clear_btn = tk.Button(log_header, text="Clear", command=self._clear_log,
-                             bg=COLORS['bg_light'], fg=COLORS['text_secondary'],
-                             font=('Segoe UI', 8), bd=0, padx=8)
-        clear_btn.pack(side='right', padx=10)
-        
-        # Log text area
-        self.log_text = tk.Text(log_frame, height=6, bg=COLORS['bg_dark'],
-                               fg=COLORS['text_secondary'], font=('Consolas', 9),
-                               state='disabled', wrap='word')
-        self.log_text.pack(fill='x', padx=10, pady=(0, 8))
-        
-        # Status bar
-        status_bar = tk.Frame(main, bg=COLORS['bg_medium'], height=28)
-        status_bar.pack(fill='x')
-        self.status_text = tk.Label(status_bar, text="Camera feed always running. Select mode to control motors.", 
+        self.status_text = tk.Label(status_frame, text="Ready", 
                                     bg=COLORS['bg_medium'], fg=COLORS['text_secondary'],
                                     font=('Segoe UI', 9))
-        self.status_text.pack(side='left', padx=10, pady=4)
-        mp_status = "MediaPipe: ✓" if MEDIAPIPE_AVAILABLE else "MediaPipe: ✗ (install for tracking)"
-        mp_color = COLORS['success'] if MEDIAPIPE_AVAILABLE else COLORS['warning']
-        tk.Label(status_bar, text=mp_status, bg=COLORS['bg_medium'], fg=mp_color,
-                font=('Segoe UI', 8)).pack(side='right', padx=10, pady=4)
+        self.status_text.pack(side='right', padx=10)
         
-        # Log initial message
-        self._log("System started. Ready.")
+        # ═══════════════════════════════════════════════════════════════
+        # MAIN CONTENT: 2/3 Camera + 1/3 Right Panel
+        # ═══════════════════════════════════════════════════════════════
+        content = tk.Frame(main, bg=COLORS['bg_dark'])
+        content.pack(fill='both', expand=True)
+        
+        # Use grid for 2/3 + 1/3 split
+        content.grid_columnconfigure(0, weight=2)  # Camera gets 2 parts
+        content.grid_columnconfigure(1, weight=1)  # Right panel gets 1 part
+        content.grid_rowconfigure(0, weight=1)
+        
+        # LEFT: Camera Panel (2/3 width)
+        self.camera_panel = CameraPanel(content, 
+                                       on_angle_change=self._on_angle_change)
+        self.camera_panel.grid(row=0, column=0, sticky='nsew', padx=(0, 4))
+        
+        # RIGHT: Visualizers + Controls (1/3 width)
+        right_panel = tk.Frame(content, bg=COLORS['bg_medium'])
+        right_panel.grid(row=0, column=1, sticky='nsew', padx=(4, 0))
+        
+        # ─────────────────────────────────────────────────────────────
+        # 1. SYSTEM LOG (Anchored Bottom - Fixed Height)
+        # ─────────────────────────────────────────────────────────────
+        log_frame = tk.Frame(right_panel, bg=COLORS['bg_medium'], height=110)
+        log_frame.pack(side='bottom', fill='x', padx=4, pady=(2, 6))
+        log_frame.pack_propagate(False)
+        
+        log_h = tk.Frame(log_frame, bg=COLORS['bg_medium'])
+        log_h.pack(fill='x')
+        tk.Label(log_h, text="📋 SYSTEM LOG", bg=COLORS['bg_medium'], 
+                fg=COLORS['text_primary'], font=('Segoe UI', 8, 'bold')).pack(side='left')
+        tk.Button(log_h, text="Clear", command=self._clear_log, bg=COLORS['bg_light'],
+                 fg=COLORS['text_secondary'], font=('Segoe UI', 7), bd=0, padx=4).pack(side='right')
+        
+        log_bg = tk.Frame(log_frame, bg='#0a0a15', padx=1, pady=1)
+        log_bg.pack(fill='both', expand=True, pady=2)
+        
+        self.log_text = tk.Text(log_bg, bg='#0a0a15', fg='#00ff00', font=('Consolas', 9),
+                               state='disabled', wrap='word', bd=0)
+        self.log_text.pack(side='left', fill='both', expand=True)
+        
+        log_sc = ttk.Scrollbar(log_bg, orient='vertical', command=self.log_text.yview)
+        log_sc.pack(side='right', fill='y')
+        self.log_text['yscrollcommand'] = log_sc.set
+
+        # ─────────────────────────────────────────────────────────────
+        # 2. DASHBOARD (Visualizers - Top)
+        # ─────────────────────────────────────────────────────────────
+        viz_frame = tk.Frame(right_panel, bg=COLORS['bg_medium'])
+        viz_frame.pack(side='top', fill='x', padx=4, pady=4)
+        
+        viz_t = tk.Frame(viz_frame, bg=COLORS['bg_medium'])
+        viz_t.pack(fill='x')
+        tk.Label(viz_t, text="📊 DETECTION", bg=COLORS['bg_medium'], fg=COLORS['text_primary'], font=('Segoe UI', 8, 'bold')).pack(side='left', expand=True)
+        tk.Label(viz_t, text="⚙️ SIMULATION", bg=COLORS['bg_medium'], fg=COLORS['text_primary'], font=('Segoe UI', 8, 'bold')).pack(side='right', expand=True)
+        
+        viz_c = tk.Frame(viz_frame, bg=COLORS['bg_dark'])
+        viz_c.pack(fill='x', pady=2)
+        viz_c.grid_columnconfigure((0,1), weight=1)
+        
+        self.body_grid = BodyGridVisualizer(viz_c, height=100)
+        self.body_grid.grid(row=0, column=0, sticky='nsew', padx=(0, 2))
+        self.motor_viz = MotorVisualizer(viz_c, height=100)
+        self.motor_viz.grid(row=0, column=1, sticky='nsew', padx=(2, 0))
+
+        # ─────────────────────────────────────────────────────────────
+        # 3. CONTROL GRID (4 COMPACT BOXES)
+        # ─────────────────────────────────────────────────────────────
+        grid_frame = tk.Frame(right_panel, bg=COLORS['bg_medium'])
+        grid_frame.pack(side='top', fill='both', expand=True, padx=4, pady=2)
+        
+        # Grid setup: 2 columns
+        grid_frame.grid_columnconfigure((0, 1), weight=1)
+        grid_frame.grid_rowconfigure((0, 1), weight=1)
+
+        # BOX 1: HARDWARE (Compact)
+        box1 = tk.LabelFrame(grid_frame, text=" 🔌 HARDWARE ", bg=COLORS['bg_medium'], fg=COLORS['text_primary'], font=('Segoe UI', 8, 'bold'), padx=4, pady=4)
+        box1.grid(row=0, column=0, sticky='nsew', padx=2, pady=2)
+        self.connection_panel = ConnectionPanel(box1, on_connect=self._on_connect, on_disconnect=self._on_disconnect, main_log=self._log)
+        self.connection_panel.pack(fill='both', expand=True)
+
+        # BOX 2: MOTION MODE (The Switch)
+        box2 = tk.LabelFrame(grid_frame, text=" ⚙️ TRACKING ", bg=COLORS['bg_medium'], fg=COLORS['text_primary'], font=('Segoe UI', 8, 'bold'), padx=4, pady=4)
+        box2.grid(row=0, column=1, sticky='nsew', padx=2, pady=2)
+        
+        # Mode Toggle Button (High Visibility Switch)
+        self.sync_btn = tk.Button(box2, text="MODE: SILHOUETTE", 
+                                 command=self._toggle_sync_mode,
+                                 bg='#2a1a1a', fg=COLORS['accent'],
+                                 activebackground=COLORS['accent'],
+                                 activeforeground='white',
+                                 bd=1, relief='solid', font=('Segoe UI', 10, 'bold'), height=2)
+        self.sync_btn.pack(fill='x', pady=(2, 8))
+        
+        opts_f = tk.Frame(box2, bg=COLORS['bg_medium'])
+        opts_f.pack(fill='x')
+        tk.Checkbutton(opts_f, text="Invert Axis", variable=self.mirror_invert, 
+                       command=self._update_tracking_params,
+                       bg=COLORS['bg_medium'], fg=COLORS['text_primary'],
+                       selectcolor=COLORS['bg_dark'], font=('Segoe UI', 8)).pack(side='left')
+        
+        tk.Button(opts_f, text="Reset", command=self._reset_motors, 
+                 bg=COLORS['warning'], fg='black', bd=0, padx=8, font=('Segoe UI', 8, 'bold')).pack(side='right')
+
+        # BOX 3: TOOLS & FX
+        box3 = tk.LabelFrame(grid_frame, text=" ✨ EFFECTS ", bg=COLORS['bg_medium'], fg=COLORS['text_primary'], font=('Segoe UI', 8, 'bold'), padx=4, pady=4)
+        box3.grid(row=1, column=0, sticky='nsew', padx=2, pady=2)
+        
+        sm_v = tk.Frame(box3, bg=COLORS['bg_medium'])
+        sm_v.pack(fill='x', pady=(0, 2))
+        self.smooth_val = tk.DoubleVar(value=0.15)
+        ttk.Scale(sm_v, from_=0.01, to=0.5, variable=self.smooth_val, command=self._update_smoothing).pack(side='left', fill='x', expand=True)
+        self.smooth_lbl = tk.Label(sm_v, text="15%", bg=COLORS['bg_medium'], fg=COLORS['text_secondary'], font=('Segoe UI', 7), width=3)
+        self.smooth_lbl.pack(side='right')
+
+        fx_grid = tk.Frame(box3, bg=COLORS['bg_medium'])
+        fx_grid.pack(fill='both', expand=True)
+        fx_grid.grid_columnconfigure((0,1), weight=1)
+        for i, (txt, cmd) in enumerate([("Wave", 'wave'), ("Breathe", 'breathe'), ("Ripple", 'ripple'), ("Random", 'random')]):
+            tk.Button(fx_grid, text=txt, command=lambda c=cmd: self._run_effect(c), 
+                     bg=COLORS['bg_dark'], fg='white', bd=0, font=('Segoe UI', 7), pady=2).grid(row=i//2, column=i%2, sticky='ew', padx=1, pady=1)
+
+        box4 = tk.LabelFrame(grid_frame, text=" 🎮 MANUAL ", bg=COLORS['bg_medium'], fg=COLORS['text_primary'], font=('Segoe UI', 8, 'bold'), padx=4, pady=4)
+        box4.grid(row=1, column=1, sticky='nsew', padx=2, pady=2)
+        self.control_panel = ManualControlPanel(box4, on_angle_change=self._on_angle_change, main_log=self._log)
+        self.control_panel.pack(fill='both', expand=True)
+
+        # LINK DETECTION VIZ (Now that both exist)
+        self.camera_panel.on_detection_change = self.body_grid.update_angles
+
+        self._log("UI layout updated - Compact Grid Mode")
+
+
+
+        # Initial log message
+        self._log("System ready in Stacked Card Mode")
     
     def _log(self, message):
         """Add a message to the live log"""
@@ -1650,11 +1961,11 @@ class SimulationVisualizer:
     def _on_mode_change(self, event=None):
         mode = self.control_mode.get()
         if mode == "Live":
-            self.mode_label.config(text="[ LIVE ]", fg=COLORS['success'])
-            self.status_text.config(text="Live mode: Motors follow camera body tracking.")
+            self.mode_label.config(text="● LIVE", fg=COLORS['success'])
+            self.status_text.config(text="Live tracking")
         else:
-            self.mode_label.config(text="[ TEST ]", fg=COLORS['accent_secondary'])
-            self.status_text.config(text="Test mode: Use manual controls to move motors.")
+            self.mode_label.config(text="● TEST", fg=COLORS['accent_secondary'])
+            self.status_text.config(text="Manual control")
     
     def _on_body_position(self, x_position):
         """Handle body position change from camera tracking"""
@@ -1662,6 +1973,11 @@ class SimulationVisualizer:
             return
         if self.control_mode.get() != "Live":
             return
+            
+        # Apply Mirror Invert if enabled
+        if hasattr(self, 'mirror_invert') and self.mirror_invert.get():
+            x_position = 1.0 - x_position
+            
         # Map body X position (0-1) to motor angles
         target_angle = x_position * 180
         angles = []
@@ -1852,9 +2168,114 @@ PCA9685 VCC → 3.3V (logic) | V+ → 5V (servo power)""")
         self.control_mode.set("Test")
         self._on_mode_change()
         self._log("Switched to Test mode")
+        
+    def _reset_motors(self):
+        """Reset all motors to 90 degrees"""
+        self._log("Resetting all motors to 90°")
+        angles = np.full(64, 90)
+        self._on_angle_change(angles)
+
+    def _calibrate_motors(self):
+        """Run calibration sequence"""
+        if self.control_mode.get() != "Test":
+            messagebox.showinfo("Calibration", "Switching to Test mode for calibration.")
+            self.control_mode.set("Test")
+            self._on_mode_change()
+            
+        def sequence():
+            self._log("Calibration: Moving to 0°")
+            self._on_angle_change(np.full(64, 0))
+            time.sleep(1.0)
+            self._log("Calibration: Moving to 180°")
+            self._on_angle_change(np.full(64, 180))
+            time.sleep(1.0)
+            self._log("Calibration: Centering (90°)")
+            self._on_angle_change(np.full(64, 90))
+            self._log("Calibration complete")
+            
+        threading.Thread(target=sequence, daemon=True).start()
+        
+    def _run_effect(self, effect_name):
+        """Run a preset motion effect (5 seconds)"""
+        self._log(f"Starting effect: {effect_name.capitalize()}")
+        if self.control_mode.get() != "Test":
+            self.control_mode.set("Test")
+            self._on_mode_change()
+            
+        def run():
+            t = 0
+            start_time = time.time()
+            import random # Ensure import
+            
+            while self.control_mode.get() == "Test":
+                angles = []
+                for i in range(64):
+                    row = i // 8
+                    col = i % 8
+                    val = 90
+                    
+                    if effect_name == 'wave':
+                         val = 90 + 45 * math.sin(t*0.2 + col*0.5)
+                    elif effect_name == 'breathe':
+                         val = 90 + 45 * math.sin(t*0.1)
+                    elif effect_name == 'ripple':
+                         dist = math.sqrt((row-3.5)**2 + (col-3.5)**2)
+                         val = 90 + 50 * math.sin(t*0.2 - dist*0.5)
+                    elif effect_name == 'random':
+                         val = random.randint(45, 135)
+                    
+                    val = max(0, min(180, val))
+                    angles.append(val)
+                
+                self._on_angle_change(np.array(angles))
+                time.sleep(0.05)
+                t += 1
+                
+                # Run for 5 seconds
+                if time.time() - start_time > 5:
+                    break
+            
+            self._log(f"Effect {effect_name} complete")
+            # Nice finish: reset to 90
+            self._on_angle_change(np.full(64, 90))
+                
+        threading.Thread(target=run, daemon=True).start()
+
+    def _update_smoothing(self, val):
+        try:
+            val = float(val)
+            self.smoothing = val
+            self.smooth_lbl.config(text=f"{int(val*100)}%")
+            self._update_tracking_params()
+        except:
+            pass
+
+    def _toggle_sync_mode(self):
+        """Toggle between Silhouette and Synchronized modes"""
+        if self.sync_mode.get():
+            self.sync_mode.set(False)
+            self.sync_btn.config(text="MODE: SILHOUETTE", fg=COLORS['accent'], bg='#2a1a1a')
+            self._log("Mode: Individual Silhouette Tracking")
+        else:
+            self.sync_mode.set(True)
+            self.sync_btn.config(text="MODE: SYNC (ALL)", fg=COLORS['success'], bg='#1a2a1a')
+            self._log("Mode: Joined Synchronized Movement")
+        self._update_tracking_params()
+
+    def _update_tracking_params(self):
+        """Update CameraPanel with latest tracking settings"""
+        if hasattr(self, 'camera_panel'):
+            # Pass smoothing (inverted scale: 0.15 responsiveness -> 0.85 smoothing factor)
+            s_factor = 1.0 - self.smoothing
+            self.camera_panel.set_tracking_params(
+                sync_mode=self.sync_mode.get(),
+                invert=self.mirror_invert.get(),
+                smoothing=s_factor
+            )
     
     def _on_angle_change(self, angles):
         """Handle angle changes from any source"""
+        # Update motor visualizer ONLY
         self.motor_viz.update_angles(angles)
         
         # Always try to send if we have a serial port (hardware mode)
