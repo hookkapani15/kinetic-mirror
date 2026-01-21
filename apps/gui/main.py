@@ -839,7 +839,7 @@ class CameraPanel(tk.Frame):
                             
                 elif frame_count % 10 == 0: # Idle reset
                     if self.on_angle_change:
-                        self.on_angle_change([90] * 64)
+                        self.on_angle_change([0] * 64)
                     if hasattr(self, 'on_detection_change') and self.on_detection_change:
                         self.on_detection_change([0] * 64)
                         
@@ -2170,9 +2170,9 @@ PCA9685 VCC → 3.3V (logic) | V+ → 5V (servo power)""")
         self._log("Switched to Test mode")
         
     def _reset_motors(self):
-        """Reset all motors to 90 degrees"""
-        self._log("Resetting all motors to 90°")
-        angles = np.full(64, 90)
+        """Reset all motors to 0 degrees"""
+        self._log("Resetting all motors to 0°")
+        angles = np.full(64, 0)
         self._on_angle_change(angles)
 
     def _calibrate_motors(self):
