@@ -1,5 +1,5 @@
 """
-Dance Mirror - LED Control GUI
+Dance Mirror - LED Control GUI (Premium UI)
 Real-time body silhouette tracking for LED wall
 
 Camera always runs, LED output controlled by Launch/Stop
@@ -7,6 +7,9 @@ Camera always runs, LED output controlled by Launch/Stop
 import tkinter as tk
 from tkinter import ttk, messagebox
 import threading
+import hmac
+import hashlib
+import struct
 import queue
 import serial
 import serial.tools.list_ports
@@ -18,6 +21,179 @@ import time
 from packages.mirror_core.controllers.led_controller import LEDController
 from packages.mirror_core.simulation.mock_serial import MockSerial
 
+
+# ============== PREMIUM THEME SYSTEM ==============
+class ThemeManager:
+    """Advanced theme management"""
+    THEMES = {
+        'modern_dark': {
+            'name': 'Modern Dark',
+            'bg_dark': '#0d1117', 'bg_medium': '#161b22', 'bg_light': '#21262d',
+            'bg_card': '#1c2128', 'accent': '#58a6ff', 'accent_secondary': '#238636',
+            'text_primary': '#f0f6fc', 'text_secondary': '#8b949e',
+            'success': '#238636', 'error': '#da3633', 'warning': '#d29922',
+            'border': '#30363d', 'shadow': '#000000',
+        },
+        'midnight_purple': {
+            'name': 'Midnight Purple', 
+            'bg_dark': '#1a1b2f', 'bg_medium': '#23243a', 'bg_light': '#2d2e45',
+            'bg_card': '#26273d', 'accent': '#c084fc', 'accent_secondary': '#a855f7',
+            'text_primary': '#f8fafc', 'text_secondary': '#94a3b8',
+            'success': '#34d399', 'error': '#f472b6', 'warning': '#fbbf24',
+            'border': '#3f3f5f', 'shadow': '#0f1019',
+        },
+        'cyberpunk': {
+            'name': 'Cyberpunk',
+            'bg_dark': '#0a0a0f', 'bg_medium': '#12121a', 'bg_light': '#1a1a25',
+            'bg_card': '#151520', 'accent': '#00f5ff', 'accent_secondary': '#ff006e',
+            'text_primary': '#ffffff', 'text_secondary': '#a0a0b0',
+            'success': '#00f5ff', 'error': '#ff006e', 'warning': '#ffbe0b',
+            'border': '#2a2a3a', 'shadow': '#000000',
+        },
+    }
+    _current = 'modern_dark'
+    _listeners = []
+    
+    @classmethod
+    def get(cls):
+        return cls.THEMES.get(cls._current, cls.THEMES['modern_dark'])
+    
+    @classmethod
+    def set(cls, name):
+        if name in cls.THEMES:
+            cls._current = name
+            for cb in cls._listeners:
+                try:
+                    cb(name)
+                except:
+                    pass
+            return True
+        return False
+    
+    @classmethod
+    def names(cls):
+        return [(k, v['name']) for k, v in cls.THEMES.items()]
+
+def lighten(hex_color, factor=0.2):
+    hex_color = hex_color.lstrip('#')
+    r = int(hex_color[0:2], 16)
+    g = int(hex_color[2:4], 16) 
+    b = int(hex_color[4:6], 16)
+    r = min(255, int(r + (255 - r) * factor))
+    g = min(255, int(g + (255 - g) * factor))
+    b = min(255, int(b + (255 - b) * factor))
+    return f'#{r:02x}{g:02x}{b:02x}'
+
+def darken(hex_color, factor=0.2):
+    hex_color = hex_color.lstrip('#')
+    r = int(hex_color[0:2], 16)
+    g = int(hex_color[2:4], 16)
+    b = int(hex_color[4:6], 16)
+    r = int(r * (1 - factor))
+    g = int(g * (1 - factor))
+    b = int(b * (1 - factor))
+    return f'#{r:02x}{g:02x}{b:02x}'
+
+class AnimatedButton(tk.Canvas):
+    """Premium button with animations"""
+    def __init__(self, parent, text, command=None, width=120, height=36, bg=None, fg='#ffffff', **kwargs):
+        colors = ThemeManager.get()
+        if bg is None:
+            bg = colors['accent']
+        super().__init__(parent, width=width, height=height, bg=colors['bg_dark'], highlightthickness=0, **kwargs)
+        self.cmd = command
+        self.txt = text
+        self.bg = bg
+        self.fg = fg
+        self.w = width
+        self.h = height
+        self.enabled = True
+        self.hover = False
+        self._draw()
+        self.bind('<Enter>', lambda e: self._set_hover(True))
+        self.bind('<Leave>', lambda e: self._set_hover(False))
+        self.bind('<Button-1>', lambda e: self._click())
+    
+    def _draw(self):
+        self.delete('all')
+        colors = ThemeManager.get()
+        r = 8
+        x1, y1 = 2, 2
+        x2, y2 = self.w - 2, self.h - 2
+        color = lighten(self.bg, 0.1) if self.hover else self.bg
+        self._round_rect(x1, y1, x2, y2, r, color)
+        self.create_text(self.w/2, self.h/2, text=self.txt, fill=self.fg, font=('Segoe UI', 9, 'bold'))
+    
+    def _round_rect(self, x1, y1, x2, y2, r, color):
+        self.create_arc(x1, y1, x1+2*r, y1+2*r, start=90, extent=90, fill=color, outline='')
+        self.create_arc(x2-2*r, y1, x2, y1+2*r, start=0, extent=90, fill=color, outline='')
+        self.create_arc(x1, y2-2*r, x1+2*r, y2, start=180, extent=90, fill=color, outline='')
+        self.create_arc(x2-2*r, y2-2*r, x2, y2, start=270, extent=90, fill=color, outline='')
+        self.create_rectangle(x1+r, y1, x2-r, y2, fill=color, outline='')
+        self.create_rectangle(x1, y1+r, x2, y2-r, fill=color, outline='')
+    
+    def _set_hover(self, val):
+        self.hover = val
+        self._draw()
+    
+    def _click(self):
+        if self.enabled and self.cmd:
+            self.cmd()
+    
+    def set_text(self, text):
+        self.txt = text
+        self._draw()
+
+class GlassCard(tk.Frame):
+    """Glass card container"""
+    def __init__(self, parent, title=None, **kwargs):
+        colors = ThemeManager.get()
+        super().__init__(parent, bg=colors['bg_dark'], **kwargs)
+        self.card = tk.Frame(self, bg=colors['bg_card'], highlightbackground=colors['border'], highlightthickness=1)
+        self.card.pack(fill='both', expand=True, padx=2, pady=2)
+        if title:
+            header = tk.Frame(self.card, bg=colors['bg_card'])
+            header.pack(fill='x', padx=10, pady=(8, 4))
+            tk.Label(header, text=title, bg=colors['bg_card'], fg=colors['accent'], font=('Segoe UI', 10, 'bold')).pack(side='left')
+            line = tk.Frame(self.card, bg=colors['accent'], height=2)
+            line.pack(fill='x', padx=10)
+        self.content = tk.Frame(self.card, bg=colors['bg_card'])
+        self.content.pack(fill='both', expand=True, padx=8, pady=8)
+
+class StatusIndicator(tk.Canvas):
+    """Animated status indicator"""
+    def __init__(self, parent, size=12, **kwargs):
+        colors = ThemeManager.get()
+        super().__init__(parent, width=size, height=size, bg=colors['bg_card'], highlightthickness=0, **kwargs)
+        self.size = size
+        self.status = False
+        self._draw()
+    
+    def set(self, status):
+        self.status = status
+        self._draw()
+    
+    def _draw(self):
+        self.delete('all')
+        colors = ThemeManager.get()
+        color = colors['success'] if self.status else colors['error']
+        r = self.size / 2 - 2
+        cx, cy = self.size / 2, self.size / 2
+        self.create_oval(cx-r, cy-r, cx+r, cy+r, fill=color, outline='')
+
+# Replace COLORS reference
+COLORS = ThemeManager.get()
+
+
+
+import subprocess
+import sys
+
+# Firmware paths for LED branch
+LED_FIRMWARE_DIR = os.path.join(os.path.dirname(__file__), '..', '..', 'firmware', 'esp32')
+LED_FIRMWARE_BIN = os.path.join(LED_FIRMWARE_DIR, '.pio', 'build', 'esp32', 'firmware.bin')
+LED_BOOTLOADER_BIN = os.path.join(LED_FIRMWARE_DIR, '.pio', 'build', 'esp32', 'bootloader.bin')
+LED_PARTITIONS_BIN = os.path.join(LED_FIRMWARE_DIR, '.pio', 'build', 'esp32', 'partitions.bin')
 
 class BodySegmenter:
     """
@@ -146,6 +322,32 @@ class LEDSimulatorPanel:
     def clear(self):
         self.led_state = [0] * 2048
     
+
+    def rollback_to_original(self):
+        """Restore original UI"""
+        if messagebox.askyesno("Rollback", "Restore original UI?\nApp will close."):
+            try:
+                import shutil
+                orig = os.path.join(os.path.dirname(__file__), 'main_leds_original.py')
+                curr = os.path.join(os.path.dirname(__file__), 'main.py')
+                if os.path.exists(orig):
+                    shutil.copy2(orig, curr)
+                    messagebox.showinfo("Done", "Original restored. Restart app.")
+                    self.root.quit()
+                else:
+                    messagebox.showerror("Error", "Backup not found.")
+            except Exception as e:
+                messagebox.showerror("Error", str(e))
+    
+    def _on_theme_change(self, event=None):
+        """Handle theme change"""
+        for key, name in ThemeManager.names():
+            if name == self.theme_var.get():
+                if ThemeManager.set(key):
+                    self.log(f"Theme: {name}")
+                    messagebox.showinfo("Theme", f"{name} selected.\nRestart to apply.")
+                break
+
     def _update_loop(self):
         try:
             self.canvas.delete("all")
@@ -164,7 +366,7 @@ class LEDSimulatorPanel:
 class LEDControlApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Dance Mirror")
+        self.root.title("Dance Mirror - Premium UI")
         self.root.geometry("1100x650+50+50")
         
         # State
@@ -345,20 +547,59 @@ class LEDControlApp:
         self.root.after(500, self._monitor_ports)
 
     def _create_ui(self):
-        """Build the UI"""
-        main = ttk.Frame(self.root, padding="10")
+        """Build the UI with Premium components"""
+        colors = ThemeManager.get()
+        self.root.configure(bg=colors['bg_dark'])
+        
+        main = tk.Frame(self.root, bg=colors['bg_dark'], padx=10, pady=10)
         main.pack(fill=tk.BOTH, expand=True)
         
+        # === HEADER: Title + Theme + Rollback ===
+        header = tk.Frame(main, bg=colors['bg_medium'], height=50)
+        header.pack(fill=tk.X, pady=(0,10))
+        header.pack_propagate(False)
+        
+        # App icon and title
+        title_frame = tk.Frame(header, bg=colors['bg_medium'])
+        title_frame.pack(side=tk.LEFT, padx=15, pady=10)
+        icon = tk.Canvas(title_frame, width=24, height=24, bg=colors['bg_medium'], highlightthickness=0)
+        icon.pack(side=tk.LEFT, padx=(0,8))
+        icon.create_oval(2, 2, 22, 22, fill=colors['accent'], outline='')
+        icon.create_text(12, 12, text="D", fill='white', font=('Segoe UI', 10, 'bold'))
+        tk.Label(title_frame, text="Dance Mirror", bg=colors['bg_medium'], 
+                fg=colors['text_primary'], font=('Segoe UI', 14, 'bold')).pack(side=tk.LEFT)
+        tk.Label(title_frame, text="LED", bg=colors['bg_medium'],
+                fg=colors['accent'], font=('Segoe UI', 14, 'bold')).pack(side=tk.LEFT, padx=(5,0))
+        
+        # Theme selector
+        theme_frame = tk.Frame(header, bg=colors['bg_medium'])
+        theme_frame.pack(side=tk.LEFT, padx=20)
+        tk.Label(theme_frame, text="Theme:", bg=colors['bg_medium'],
+                fg=colors['text_secondary'], font=('Segoe UI', 9)).pack(side=tk.LEFT)
+        self.theme_var = tk.StringVar(value='modern_dark')
+        theme_combo = ttk.Combobox(theme_frame, textvariable=self.theme_var,
+                                   values=[name for key, name in ThemeManager.names()],
+                                   state='readonly', width=12)
+        theme_combo.pack(side=tk.LEFT, padx=5)
+        theme_combo.bind('<<ComboboxSelected>>', self._on_theme_change)
+        
+        # Rollback button
+        rollback_btn = AnimatedButton(header, text="[ Rollback ]",
+                                     command=self.rollback_to_original,
+                                     width=100, height=28, bg=colors['error'])
+        rollback_btn.pack(side=tk.LEFT, padx=5)
+        
         # === LEFT: Controls + Camera ===
-        left = ttk.Frame(main)
+        left = tk.Frame(main, bg=colors['bg_dark'])
         left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0,10))
         
         # --- Launch Controls (single row) ---
-        ctrl_frame = ttk.LabelFrame(left, text="Launch Controls", padding="10")
+        ctrl_frame = tk.Frame(left, bg=colors['bg_card'], highlightbackground=colors['border'],
+                             highlightthickness=1, padx=10, pady=10)
         ctrl_frame.pack(fill=tk.X, pady=(0,10))
         
         # Port
-        ttk.Label(ctrl_frame, text="Port:").pack(side=tk.LEFT, padx=(0,5))
+        tk.Label(ctrl_frame, text="Port:", bg=colors['bg_card'], fg=colors['text_primary']).pack(side=tk.LEFT, padx=(0,5))
         self.port_var = tk.StringVar()
         self.port_combo = ttk.Combobox(ctrl_frame, textvariable=self.port_var, width=12, values=self.available_ports)
         
@@ -386,7 +627,7 @@ class LEDControlApp:
         self.refresh_btn.pack(side=tk.LEFT, padx=(0,15))
         
         # Camera
-        ttk.Label(ctrl_frame, text="Camera:").pack(side=tk.LEFT, padx=(0,5))
+        tk.Label(ctrl_frame, text="Camera:", bg=colors['bg_card'], fg=colors['text_primary']).pack(side=tk.LEFT, padx=(0,5))
         self.cam_var = tk.StringVar()
         self.cam_combo = ttk.Combobox(ctrl_frame, textvariable=self.cam_var, width=5, values=self.available_cameras)
         # Default to camera 1 if available, otherwise first available
@@ -398,31 +639,40 @@ class LEDControlApp:
         self.launch_btn = ttk.Button(ctrl_frame, text="▶ LAUNCH", command=self._toggle_output, width=12)
         self.launch_btn.pack(side=tk.LEFT, padx=(0,10))
         
+        # Flash Firmware Button
+        self.flash_btn = AnimatedButton(ctrl_frame, text="[ FLASH ]", 
+                                       command=self._flash_firmware, width=90, height=28,
+                                       bg=COLORS['warning'])
+        self.flash_btn.pack(side=tk.LEFT, padx=(0,10))
+        
         # Status
         self.status_var = tk.StringVar(value="Ready")
-        self.status_label = ttk.Label(ctrl_frame, textvariable=self.status_var, foreground="gray")
+        self.status_label = tk.Label(ctrl_frame, textvariable=self.status_var, bg=colors['bg_card'], fg=colors['text_secondary'])
         self.status_label.pack(side=tk.LEFT, padx=10)
         
         # --- Camera Feed ---
-        cam_frame = ttk.LabelFrame(left, text="Camera Feed (Always On)", padding="5")
+        cam_frame = tk.Frame(left, bg=colors['bg_card'], highlightbackground=colors['border'], highlightthickness=1)
+        tk.Label(cam_frame, text="Camera Feed (Always On)", bg=colors['bg_card'], fg=colors['accent'], font=('Segoe UI', 10, 'bold')).pack(anchor=tk.W, padx=5, pady=5)
         cam_frame.pack(fill=tk.BOTH, expand=True, pady=(0,10))
         
-        self.video_label = ttk.Label(cam_frame, text="Starting camera...")
+        self.video_label = tk.Label(cam_frame, text="Starting camera...", bg=colors['bg_card'], fg=colors['text_secondary'])
         self.video_label.pack(fill=tk.BOTH, expand=True)
         
         # --- Log ---
-        log_frame = ttk.LabelFrame(left, text="Log", padding="5")
+        log_frame = tk.Frame(left, bg=colors['bg_card'], highlightbackground=colors['border'], highlightthickness=1)
+        tk.Label(log_frame, text="Log", bg=colors['bg_card'], fg=colors['accent'], font=('Segoe UI', 10, 'bold')).pack(anchor=tk.W, padx=5, pady=5)
         log_frame.pack(fill=tk.X)
         
-        self.log_text = tk.Text(log_frame, height=3, wrap=tk.WORD)
+        self.log_text = tk.Text(log_frame, height=3, wrap=tk.WORD, bg=colors['bg_dark'], fg=colors['accent'], insertbackground=colors['accent'])
         self.log_text.pack(fill=tk.X)
         
         # === RIGHT: LED Simulator + Test Patterns ===
-        right = ttk.Frame(main)
+        right = tk.Frame(main, bg=colors['bg_dark'])
         right.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
         
         # LED Simulator
-        sim_frame = ttk.LabelFrame(right, text="LED Output (32x64)", padding="10")
+        sim_frame = tk.Frame(right, bg=colors['bg_card'], highlightbackground=colors['border'], highlightthickness=1)
+        tk.Label(sim_frame, text="LED Output (32x64)", bg=colors['bg_card'], fg=colors['accent'], font=('Segoe UI', 10, 'bold')).pack(anchor=tk.W, padx=10, pady=5)
         sim_frame.pack(fill=tk.BOTH, expand=True)
         
         self.led_simulator = LEDSimulatorPanel(sim_frame)
@@ -488,6 +738,92 @@ class LEDControlApp:
         self.scroll_active = False
         self.scroll_offset = 0
 
+
+    def _flash_firmware(self):
+        """Flash LED firmware to ESP32"""
+        if not os.path.exists(LED_FIRMWARE_BIN):
+            messagebox.showerror("Flash Error", "Firmware not found.\nBuild it first with: pio run")
+            return
+        
+        port = self.port_var.get()
+        if port == "SIMULATOR":
+            messagebox.showerror("Flash Error", "Cannot flash SIMULATOR")
+            return
+        
+        if not messagebox.askyesno("Flash Firmware", 
+            f"Flash LED firmware to {port}?\n\n"
+            "1. Hold BOOT button\n"
+            "2. Press RESET\n"
+            "3. Release RESET, then BOOT\n\n"
+            "Continue?"):
+            return
+        
+        self._log(f"[FLASH] Starting flash to {port}...")
+        self.flash_btn.set_enabled(False)
+        
+        threading.Thread(target=self._do_flash, args=(port,), daemon=True).start()
+    
+    def _do_flash(self, port):
+        """Perform firmware flash"""
+        try:
+            # Install esptool if needed
+            try:
+                import esptool
+            except ImportError:
+                self._log("[FLASH] Installing esptool...")
+                subprocess.run([sys.executable, '-m', 'pip', 'install', 'esptool', '-q'], 
+                             capture_output=True)
+            
+            self._log("[FLASH] Detecting chip type...")
+            detect_cmd = [sys.executable, '-m', 'esptool', '--port', port, 'chip_id']
+            result = subprocess.run(detect_cmd, capture_output=True, text=True, timeout=30)
+            output = result.stdout + result.stderr
+            
+            chip_type = 'esp32s3' if 'esp32-s3' in output.lower() or 'esp32s3' in output.lower() else 'esp32'
+            self._log(f"[FLASH] Detected: {chip_type.upper()}")
+            
+            # Build flash command
+            cmd = [
+                sys.executable, '-m', 'esptool',
+                '--chip', chip_type,
+                '--port', port,
+                '--baud', '115200',
+                '--before', 'default_reset',
+                '--after', 'hard_reset',
+                '--no-stub',
+                'write_flash',
+                '--flash_mode', 'dio',
+                '--flash_freq', '40m',
+                '--flash_size', 'detect',
+                '0x1000', LED_BOOTLOADER_BIN,
+                '0x8000', LED_PARTITIONS_BIN,
+                '0x10000', LED_FIRMWARE_BIN
+            ]
+            
+            self._log("[FLASH] Flashing...")
+            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, 
+                                     stderr=subprocess.STDOUT, text=True, bufsize=1)
+            
+            for line in process.stdout:
+                line = line.strip()
+                if line and ('Writing' in line or 'Hash' in line or 'Error' in line):
+                    self._log(f"[FLASH] {line}")
+            
+            process.wait()
+            
+            if process.returncode == 0:
+                self._log("[FLASH] SUCCESS! Device will restart.")
+                messagebox.showinfo("Success", "Firmware flashed successfully!")
+            else:
+                self._log("[FLASH] FAILED")
+                messagebox.showerror("Error", "Flash failed. Check log.")
+                
+        except Exception as e:
+            self._log(f"[FLASH] Error: {e}")
+            messagebox.showerror("Flash Error", str(e))
+        finally:
+            self.flash_btn.set_enabled(True)
+
     def _log(self, msg):
         try:
             self.log_text.insert(tk.END, f"{msg}\n")
@@ -495,6 +831,31 @@ class LEDControlApp:
             if int(self.log_text.index('end-1c').split('.')[0]) > 30:
                 self.log_text.delete('1.0', '2.0')
         except: pass
+    
+    def rollback_to_original(self):
+        """Restore original UI"""
+        if messagebox.askyesno("Rollback", "Restore original UI?\nApp will close."):
+            try:
+                import shutil
+                orig = os.path.join(os.path.dirname(__file__), 'main_leds_original.py')
+                curr = os.path.join(os.path.dirname(__file__), 'main.py')
+                if os.path.exists(orig):
+                    shutil.copy2(orig, curr)
+                    messagebox.showinfo("Done", "Original restored. Restart app.")
+                    self.root.quit()
+                else:
+                    messagebox.showerror("Error", "Backup not found.")
+            except Exception as e:
+                messagebox.showerror("Error", str(e))
+    
+    def _on_theme_change(self, event=None):
+        """Handle theme change"""
+        for key, name in ThemeManager.names():
+            if name == self.theme_var.get():
+                if ThemeManager.set(key):
+                    self._log(f"Theme: {name}")
+                    messagebox.showinfo("Theme", f"{name} selected.\nRestart to apply.")
+                break
 
     # =========================================================================
     # MODE SWITCHING
