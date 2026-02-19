@@ -10,6 +10,7 @@ import time
 import math
 import threading
 import random
+import struct
 import serial
 import serial.tools.list_ports
 import cv2
@@ -551,18 +552,26 @@ class CameraPanel(tk.Frame):
         self.start_btn.pack(side='right', padx=5)
     
     def _detect_cameras(self):
-        """Detect available cameras"""
-        cameras = []
-        
-        # Test camera indices 0-9
-        for i in range(10):
-            cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)
-            if cap.isOpened():
-                ret, frame = cap.read()
-                if ret and frame is not None:
-                    cameras.append(f"Camera {i}")
-                cap.release()
-        
+        """Detect available cameras (runs in background to avoid UI freeze)"""
+        def _scan():
+            cameras = []
+            # Test camera indices 0-4 (5 is enough, 10 was too slow)
+            for i in range(5):
+                try:
+                    cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)
+                    if cap.isOpened():
+                        ret, frame = cap.read()
+                        if ret and frame is not None:
+                            cameras.append(f"Camera {i}")
+                        cap.release()
+                except Exception:
+                    pass
+            # Update UI on main thread
+            self.after(0, lambda: self._apply_cameras(cameras))
+        threading.Thread(target=_scan, daemon=True).start()
+    
+    def _apply_cameras(self, cameras):
+        """Apply detected cameras to UI (must run on main thread)"""
         if cameras:
             self.camera_combo['values'] = cameras
             if len(cameras) > 1:
@@ -594,7 +603,7 @@ class CameraPanel(tk.Frame):
         
         try:
             cam_idx = int(cam_str.split()[-1])
-        except:
+        except (ValueError, IndexError):
             cam_idx = 0
         
         # Open camera with DirectShow for Windows (faster)
@@ -666,9 +675,6 @@ class CameraPanel(tk.Frame):
         self.running = False
         self._display_scheduled = False
         
-        # Wait for threads to finish
-        time.sleep(0.2)
-        
         if self.cap:
             self.cap.release()
             self.cap = None
@@ -720,6 +726,8 @@ class CameraPanel(tk.Frame):
         """
         while self.running and self.cap:
             try:
+                if not self.cap.isOpened():
+                    break
                 ret, frame = self.cap.read()
                 if not ret or frame is None:
                     continue
@@ -1078,52 +1086,82 @@ class ConnectionPanel(tk.Frame):
         
         port = port_str.replace('★', '').strip()
         
-        try:
-            if port == "SIMULATOR":
-                self.serial_port = None
+        if port == "SIMULATOR":
+            self.serial_port = None
+            self.connected = True
+            self._update_ui_connected(port)
+            if self.on_connect_callback:
+                self.on_connect_callback(None, True)
+        else:
+            # Disable button while connecting
+            self.connect_btn.set_enabled(False)
+            self.status_label.config(text="Connecting...", fg=COLORS['warning'])
+            # Run connection in background to avoid blocking UI
+            threading.Thread(target=self._connect_bg, args=(port,), daemon=True).start()
+    
+    def _connect_bg(self, port):
+        """Background thread for serial connection (avoids blocking UI)"""
+        max_retries = 3
+        last_error = None
+        
+        for attempt in range(max_retries):
+            try:
+                ser = serial.Serial(port=port, baudrate=460800, timeout=1, write_timeout=1.0)
+                # DTR/RTS reset sequence to properly boot ESP32
+                ser.dtr = False
+                ser.rts = False
+                time.sleep(0.1)
+                ser.dtr = True
+                ser.rts = True
+                time.sleep(0.1)
+                ser.dtr = False
+                ser.rts = False
+                time.sleep(2.0)  # Wait for ESP32 boot
+                
+                # Drain any boot messages
+                try:
+                    ser.reset_input_buffer()
+                except Exception:
+                    pass
+                
+                self.serial_port = ser
                 self.connected = True
-                self._update_ui_connected(port)
+                # Update UI on main thread
+                self.after(0, lambda: self._update_ui_connected(port))
+                self.after(0, lambda: self.connect_btn.set_enabled(True))
                 if self.on_connect_callback:
-                    self.on_connect_callback(None, True)
+                    self.after(0, lambda: self.on_connect_callback(self.serial_port, False))
+                return  # Success!
+            except serial.SerialException as e:
+                last_error = e
+                time.sleep(0.5)  # Wait before retry
+        
+        # All retries failed — update UI on main thread
+        error_msg = str(last_error) if last_error else "Unknown error"
+        def _show_error():
+            self.connect_btn.set_enabled(True)
+            self.status_label.config(text="Disconnected", fg=COLORS['text_secondary'])
+            if "Access is denied" in error_msg or "PermissionError" in error_msg:
+                messagebox.showerror("Port Busy", 
+                    f"Cannot access {port}.\n\n"
+                    f"Please check:\n"
+                    f"• Close Arduino IDE or Serial Monitor\n"
+                    f"• Close any other program using {port}\n"
+                    f"• Unplug and replug the USB cable\n\n"
+                    f"Error: {error_msg}")
             else:
-                # Try to connect with retry
-                max_retries = 3
-                last_error = None
-                
-                for attempt in range(max_retries):
-                    try:
-                        self.serial_port = serial.Serial(port=port, baudrate=460800, timeout=1)
-                        time.sleep(0.3)
-                        self.connected = True
-                        self._update_ui_connected(port)
-                        if self.on_connect_callback:
-                            self.on_connect_callback(self.serial_port, False)
-                        return  # Success!
-                    except serial.SerialException as e:
-                        last_error = e
-                        time.sleep(0.5)  # Wait before retry
-                
-                # All retries failed
-                error_msg = str(last_error) if last_error else "Unknown error"
-                if "Access is denied" in error_msg or "PermissionError" in error_msg:
-                    messagebox.showerror("Port Busy", 
-                        f"Cannot access {port}.\n\n"
-                        f"Please check:\n"
-                        f"• Close Arduino IDE or Serial Monitor\n"
-                        f"• Close any other program using {port}\n"
-                        f"• Unplug and replug the USB cable\n\n"
-                        f"Error: {error_msg}")
-                else:
-                    messagebox.showerror("Connection Error", f"Failed: {error_msg}")
-                    
-        except Exception as e:
-            messagebox.showerror("Connection Error", f"Failed: {e}")
+                messagebox.showerror("Connection Error", f"Failed: {error_msg}")
+        self.after(0, _show_error)
     
     def _disconnect(self):
         if self.serial_port:
             try:
+                self.serial_port.reset_output_buffer()
+            except Exception:
+                pass
+            try:
                 self.serial_port.close()
-            except:
+            except Exception:
                 pass
             self.serial_port = None
         
@@ -1476,19 +1514,21 @@ class ConnectionPanel(tk.Frame):
             self.after(100, self._flash_complete)
     
     def _log_flash(self, text):
-        """Log to flash output and main system log"""
+        """Log to flash output and main system log (thread-safe)"""
+        def _do_log():
+            try:
+                self.flash_log.config(state='normal')
+                self.flash_log.insert('end', text + '\n')
+                self.flash_log.see('end')
+                self.flash_log.config(state='disabled')
+            except Exception:
+                pass
         try:
-            # Log to local flash log widget
-            self.flash_log.config(state='normal')
-            self.flash_log.insert('end', text + '\n')
-            self.flash_log.see('end')
-            self.flash_log.config(state='disabled')
-            
-            # Also log to main system log
+            self.after(0, _do_log)
             if self.main_log:
-                self.main_log(f"[FLASH] {text}")
-        except Exception as e:
-            print(f"Log error: {e}")
+                self.after(0, lambda: self.main_log(f"[FLASH] {text}"))
+        except Exception:
+            print(f"[FLASH] {text}")
     
     def _flash_complete(self):
         """Clean up after flash"""
@@ -1654,7 +1694,8 @@ class ManualControlPanel(tk.Frame):
                 self.on_angle_change(angles)
             time.sleep(0.05)
         
-        self._set_angle(90)
+        # Update UI on main thread
+        self.after(0, lambda: self._set_angle(90))
     
     def _test_motors(self):
         """Toggle continuous motor test"""
@@ -1714,8 +1755,8 @@ class ManualControlPanel(tk.Frame):
             
             time.sleep(0.3)
         
-        # Reset to center when stopped
-        self._set_angle(90)
+        # Reset to center when stopped (main thread)
+        self.after(0, lambda: self._set_angle(90))
 
 
 class SimulationVisualizer:
@@ -1725,11 +1766,12 @@ class SimulationVisualizer:
         self.root = root
         self.root.configure(bg=COLORS['bg_dark'])
         self.virtual_device = None
+        self._serial_error_count = 0  # Track serial errors to avoid log spam
         if get_virtual_device_instance:
             try:
                 self.virtual_device = get_virtual_device_instance()
-            except:
-                pass
+            except Exception as e:
+                print(f"[WARN] Virtual device init failed: {e}")
         self.serial_port = None
         self.simulation_mode = True
         self.running = True
@@ -2289,31 +2331,53 @@ PCA9685 VCC → 3.3V (logic) | V+ → 5V (servo power)""")
                 pass
     
     def _send_motor_packet(self, angles):
-        """Send motor angles to ESP32"""
+        """Send motor angles to ESP32 (optimized with struct.pack)"""
         if not self.serial_port:
-            self._log("No serial port - cannot send")
+            return
+        
+        # Guard: check port is still open
+        try:
+            if not self.serial_port.is_open:
+                self._serial_error_count += 1
+                if self._serial_error_count == 1:
+                    print("[WARN] Serial port closed unexpectedly")
+                return
+        except Exception:
             return
         
         try:
-            # Protocol: 0xAA 0xBB 0x02 + 128 bytes (64 servos * 2 bytes)
-            packet = bytearray([0xAA, 0xBB, 0x02])
-            
             # Ensure we have 64 angles (pad with 90 if needed)
             motor_angles = list(angles[:64]) + [90] * max(0, 64 - len(angles))
             
+            # Build packet efficiently with struct
+            # Header: 0xAA 0xBB 0x02
+            values = []
             for angle in motor_angles:
-                angle = max(0, min(180, int(angle)))
-                value = int((angle / 180.0) * 1000)  # Map 0-180 to 0-1000
-                packet.append((value >> 8) & 0xFF)  # High byte
-                packet.append(value & 0xFF)         # Low byte
+                a = max(0, min(180, int(angle)))
+                values.append(int((a / 180.0) * 1000))
             
-            # Write packet
+            packet = b'\xAA\xBB\x02' + struct.pack('>' + 'H' * 64, *values)
             self.serial_port.write(packet)
-            self.serial_port.flush()
+            self._serial_error_count = 0  # Reset on success
             
+        except serial.SerialTimeoutException:
+            # Buffer full - clear it and skip this packet
+            try:
+                self.serial_port.reset_output_buffer()
+            except Exception:
+                pass
+        except (OSError, serial.SerialException) as e:
+            self._serial_error_count += 1
+            if self._serial_error_count <= 3:
+                print(f"[WARN] Serial error ({self._serial_error_count}): {e}")
+            if self._serial_error_count >= 10:
+                print("[ERROR] Too many serial errors — auto-disconnecting")
+                self.serial_port = None
+                self.root.after(0, lambda: self.connection_panel._disconnect())
         except Exception as e:
-            # Log only on real failure
-            print(f"Send error: {e}")
+            self._serial_error_count += 1
+            if self._serial_error_count <= 3:
+                print(f"Send error: {e}")
     
     def _update_loop(self):
         """Main update loop for simulation sync"""
@@ -2328,19 +2392,36 @@ PCA9685 VCC → 3.3V (logic) | V+ → 5V (servo power)""")
                 if not self.camera_panel.running:
                     motor_angles = state.get('motors', [90] * 64)
                     self.motor_viz.update_angles(motor_angles)
-            except:
-                pass
+            except Exception:
+                pass  # Virtual device may not be available
         
         self.root.after(50, self._update_loop)
     
     def stop(self):
-        """Stop the application"""
+        """Stop the application cleanly"""
         self.running = False
-        self.camera_panel.stop()
+        
+        # Stop camera panel
+        try:
+            self.camera_panel.stop()
+        except Exception:
+            pass
+        
+        # Stop connection monitor thread
+        try:
+            self.connection_panel.monitor_running = False
+        except Exception:
+            pass
+        
+        # Close serial port
         if self.serial_port:
             try:
+                self.serial_port.reset_output_buffer()
+            except Exception:
+                pass
+            try:
                 self.serial_port.close()
-            except:
+            except Exception:
                 pass
 
 def kill_duplicate_processes():
@@ -2348,12 +2429,16 @@ def kill_duplicate_processes():
     try:
         import psutil
     except ImportError:
-        # Install psutil if not available
-        subprocess.run([sys.executable, '-m', 'pip', 'install', 'psutil', '-q'], capture_output=True)
-        import psutil
+        try:
+            subprocess.run([sys.executable, '-m', 'pip', 'install', 'psutil', '-q'], capture_output=True)
+            import psutil
+        except Exception:
+            print("[WARN] psutil not available — skipping duplicate check")
+            return 0
     
     current_pid = os.getpid()
-    script_name = 'sim_visualizer'
+    # Match both old and new script names
+    script_names = ['sim_visualizer', 'apps.gui.main', 'apps/gui/main', 'apps\\gui\\main']
     killed_count = 0
     
     for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
@@ -2366,7 +2451,7 @@ def kill_duplicate_processes():
             
             # Check if this is another instance of our script
             if 'python' in proc.info.get('name', '').lower():
-                if script_name in cmdline_str or 'sim_visualizer' in cmdline_str:
+                if any(name in cmdline_str for name in script_names):
                     print(f"Killing duplicate process: PID {proc.info['pid']}")
                     proc.kill()
                     killed_count += 1
