@@ -892,7 +892,24 @@ class CameraPanel(tk.Frame):
                     break
             
             if frame is not None:
-                # Add simple "BODY" indicator when detected
+                # Overlay segmentation mask as translucent cyan highlight
+                seg_mask = self._last_seg_mask
+                if seg_mask is not None:
+                    try:
+                        h, w = frame.shape[:2]
+                        mask_resized = cv2.resize(seg_mask, (w, h), interpolation=cv2.INTER_NEAREST)
+                        # Create cyan overlay where body is detected
+                        overlay = frame.copy()
+                        body_pixels = mask_resized > 50
+                        overlay[body_pixels] = (
+                            overlay[body_pixels] * 0.6 + 
+                            np.array([180, 60, 0], dtype=np.uint8) * 0.4  # Cyan tint (BGR)
+                        ).astype(np.uint8)
+                        frame = overlay
+                    except Exception:
+                        pass  # Silently skip overlay on error
+                
+                # Add "BODY" indicator when detected
                 if self.body_detected:
                     cv2.putText(frame, "BODY", (10, 20),
                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
