@@ -1,0 +1,17 @@
+COLORS = {
+    'bg_dark': '#1a1a2e',
+    'bg_medium': '#16213e',
+    'bg_light': '#0f3460',
+    'accent': '#e94560',
+    'accent_secondary': '#00d4ff',
+    'text_primary': '#ffffff',
+    'text_secondary': '#a0a0a0',
+    'success': '#00ff88',
+    'warning': '#ffaa00',
+    'error': '#ff4444',
+    'motor_body': '#2d2d2d',
+    'motor_horn': '#00d4ff',
+    'motor_active': '#00ff88',
+    'motor_neutral': '#666666',
+    'grid_line': '#333355',
+}
