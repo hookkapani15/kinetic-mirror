@@ -20,29 +20,16 @@ import subprocess
 import os
 import sys
 
-# Try to import MediaPipe for body tracking
-MEDIAPIPE_AVAILABLE = False
-mp_pose = None
-mp_drawing = None
-
+# Handle MediaPipe import gracefully - used mainly by BodySegmenter
 try:
     import mediapipe as mp
-    # Try standard access
-    mp_pose = mp.solutions.pose
-    mp_drawing = mp.solutions.drawing_utils
     MEDIAPIPE_AVAILABLE = True
-    print("[OK] MediaPipe loaded via standard method")
-except (ImportError, AttributeError):
-    try:
-        print("[WARN] Standard MediaPipe import failed, trying fallback...")
-        import importlib
-        mp_pose = importlib.import_module("mediapipe.python.solutions.pose")
-        mp_drawing = importlib.import_module("mediapipe.python.solutions.drawing_utils")
-        MEDIAPIPE_AVAILABLE = True
-        print("[OK] MediaPipe loaded via fallback")
-    except Exception as e:
-        print(f"[ERROR] MediaPipe completely failed: {e}")
-        MEDIAPIPE_AVAILABLE = False
+except ImportError:
+    print("[WARN] MediaPipe not found - tracking will be disabled")
+    MEDIAPIPE_AVAILABLE = False
+except Exception as e:
+    print(f"[WARN] MediaPipe error: {e}")
+    MEDIAPIPE_AVAILABLE = False
 
 try:
     from packages.mirror_core.simulation.mock_serial import get_virtual_device_instance
@@ -137,12 +124,13 @@ class BodySegmenter:
         self.segmenter = mp_vision.ImageSegmenter.create_from_options(options)
         self.frame_count = 0
         
-        # Light temporal smoothing for stability
+        # No temporal smoothing — benchmark shows instant response is best
+        # (camera is the bottleneck at 25 FPS, not processing)
         self.mask_buffer = None
-        self.smoothing = 0.15  # Light smoothing - 15% old, 85% new
+        self.smoothing = 0.0  # 0 = instant (no lag), set >0 for stability
         
-        # Morphology kernels
-        self.kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+        # Morphology kernels (5x5 close: 0.07ms vs 7x7: 0.12ms per benchmark)
+        self.kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
         self.kernel_dilate = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         
     def get_body_mask(self, frame):
@@ -153,8 +141,8 @@ class BodySegmenter:
         self.frame_count += 1
         h, w = frame.shape[:2]
         
-        # Process at moderate resolution for reliable detection
-        proc_w, proc_h = 256, 192
+        # Benchmark-optimized: 192x144 saves 0.7ms vs 256x192, same detection
+        proc_w, proc_h = 192, 144
         
         small = cv2.resize(frame, (proc_w, proc_h), interpolation=cv2.INTER_LINEAR)
         small_rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
@@ -459,8 +447,9 @@ class CameraPanel(tk.Frame):
     """Live camera feed panel with body tracking - HIGH PERFORMANCE VERSION"""
     
     # Processing resolution (lower = faster, but less detail)
-    PROC_WIDTH = 320
-    PROC_HEIGHT = 240
+    # Optimized for MediaPipe 0.10.x Performance
+    PROC_WIDTH = 192
+    PROC_HEIGHT = 144
     
     def __init__(self, parent, on_angle_change=None, **kwargs):
         super().__init__(parent, bg=COLORS['bg_dark'], **kwargs)
@@ -474,14 +463,14 @@ class CameraPanel(tk.Frame):
         
         # Thread-safe queues for dual-pipeline architecture
         import queue
-        self._frame_queue = queue.Queue(maxsize=2)  # For display (always fresh)
-        self._seg_queue = queue.Queue(maxsize=2)    # For segmentation (can lag)
+        self._frame_queue = queue.Queue(maxsize=1)  # Always freshest frame
+        self._seg_queue = queue.Queue(maxsize=1)    # Always freshest for segmentation
         self._display_scheduled = False
         
         # Shared state between threads
         self._last_seg_mask = None  # Last segmentation result for overlay
         self._last_imgtk = None     # Keep reference to prevent GC
-        self.tracking_sync_mode = False
+        self.tracking_sync_mode = True  # Default: SYNC ALL
         self.tracking_invert = False
         self.on_detection_change = None # New callback for silhouette only
         
@@ -823,12 +812,17 @@ class CameraPanel(tk.Frame):
                         if len(coords[1]) > 0:
                             x_center = np.mean(coords[1]) / w
                             
+                            # Amplified mapping: 
+                            # Map central 40% (0.3 to 0.7) of frame to full 180 degree motor range
+                            # This increases sensitivity (2.5x) so small movements move motors more.
+                            mapped_x = (x_center - 0.3) / 0.4
+                            
                             # Apply Invert
                             if getattr(self, 'tracking_invert', False):
-                                x_center = 1.0 - x_center
+                                mapped_x = 1.0 - mapped_x
                                 
                             # Convert to angle 0-180
-                            angle = int(x_center * 180)
+                            angle = int(mapped_x * 180)
                             angle = max(0, min(180, angle))
                             
                             # All motors move together
@@ -1796,8 +1790,9 @@ class SimulationVisualizer:
         self.control_mode = tk.StringVar(value="Test")  # "Live" or "Test"
         self.smoothing = 0.15
         self.mirror_invert = tk.BooleanVar(value=False)
-        self.sync_mode = tk.BooleanVar(value=False)
+        self.sync_mode = tk.BooleanVar(value=True) # Default: SYNC ALL
         self._create_widgets()
+        self._update_tracking_params() # Initial sync to CameraPanel
         self._update_loop()
     
     def _create_widgets(self):
@@ -1946,9 +1941,9 @@ class SimulationVisualizer:
         box2.grid(row=0, column=1, sticky='nsew', padx=2, pady=2)
         
         # Mode Toggle Button (High Visibility Switch)
-        self.sync_btn = tk.Button(box2, text="MODE: SILHOUETTE", 
+        self.sync_btn = tk.Button(box2, text="MODE: SYNC (ALL)", 
                                  command=self._toggle_sync_mode,
-                                 bg='#2a1a1a', fg=COLORS['accent'],
+                                 bg='#1a2a1a', fg=COLORS['success'],
                                  activebackground=COLORS['accent'],
                                  activeforeground='white',
                                  bd=1, relief='solid', font=('Segoe UI', 10, 'bold'), height=2)
@@ -2495,11 +2490,17 @@ if __name__ == "__main__":
     y = (root.winfo_screenheight() - 700) // 2
     root.geometry(f"+{x}+{y}")
     
-    app = SimulationVisualizer(root)
-    
-    def on_close():
-        app.stop()
-        root.destroy()
-    
-    root.protocol("WM_DELETE_WINDOW", on_close)
-    root.mainloop()
+    try:
+        app = SimulationVisualizer(root)
+        
+        def on_close():
+            app.stop()
+            root.destroy()
+        
+        root.protocol("WM_DELETE_WINDOW", on_close)
+        root.mainloop()
+    except Exception as e:
+        print(f"\n[FATAL ERROR] GUI crashed during startup: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)

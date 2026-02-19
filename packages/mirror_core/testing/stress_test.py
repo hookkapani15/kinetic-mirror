@@ -41,14 +41,34 @@ def build_servo_packet(angles):
     return header + data
 
 
-def wait_for_ready(ser, timeout=5):
-    """Wait for ESP32 to send READY after boot."""
+def wait_for_ready(ser, timeout=25):
+    """Wait for ESP32 to send READY after boot.
+    
+    Reads raw bytes and buffers lines manually because the ESP32
+    prints WiFi dots without newlines, which blocks readline().
+    """
     start = time.time()
+    buf = b''
     while time.time() - start < timeout:
         if ser.in_waiting:
-            line = ser.readline().decode('utf-8', errors='replace').strip()
+            chunk = ser.read(ser.in_waiting)
+            buf += chunk
+            # Process complete lines
+            while b'\n' in buf:
+                line_bytes, buf = buf.split(b'\n', 1)
+                line = line_bytes.decode('utf-8', errors='replace').strip()
+                if line:
+                    print(f"  ESP32: {line}")
+                    if 'READY' in line or 'STRESS' in line or 'FPS' in line:
+                        return True
+        else:
+            time.sleep(0.05)
+    # Check remaining buffer
+    if buf:
+        line = buf.decode('utf-8', errors='replace').strip()
+        if line:
             print(f"  ESP32: {line}")
-            if 'READY' in line or 'STRESS' in line:
+            if 'READY' in line or 'STRESS' in line or 'FPS' in line:
                 return True
     return False
 

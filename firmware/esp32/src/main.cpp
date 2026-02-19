@@ -52,7 +52,7 @@ const char *password = "loki@1234";
 
 #define PWM_MIN 250
 #define PWM_MAX 470
-#define SMOOTH_ALPHA 0.3
+#define SMOOTH_ALPHA 1.0    // Optimized: 1.0 = instant response (no smoothing lag)
 
 // ==================== SERIAL PROTOCOL ====================
 #define BAUD_RATE 460800
@@ -255,6 +255,7 @@ void setup() {
   Serial.println("Init servos (64 channels, 4 boards)...");
   // Use custom I2C pins: SDA=GPIO18, SCL=GPIO19
   Wire.begin(18, 19);  // SDA=D18, SCL=D19
+  Wire.setClock(400000); // Optimized: 400kHz Fast Mode
 
   // Initialize all 4 PCA9685 boards
   pwm1.begin();
@@ -412,5 +413,5 @@ void loop() {
     lastFPSUpdate = millis();
   }
 
-  delay(5);
+  // No loop delay for maximum performance
 }
