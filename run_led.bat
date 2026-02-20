@@ -1,4 +1,4 @@
 @echo off
 echo Starting Mirror LED Application...
-python -m apps.gui.main_led
+python -m apps.gui.gui_led
 pause

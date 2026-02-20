@@ -1,5 +1,5 @@
 @echo off
 cd /d "%~dp0"
 set PYTHONPATH=%~dp0;%PYTHONPATH%
-python apps\gui\gui_led.py
+python apps\gui\main.py
 pause
