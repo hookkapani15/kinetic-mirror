@@ -9,7 +9,7 @@ import logging
 
 from .theme import COLORS
 from .widgets import ModernButton
-from ..core.segmentation import BodySegmenter
+from core.segmentation import BodySegmenter
 
 logger = logging.getLogger("main")
 
@@ -21,15 +21,19 @@ class CameraPanel(tk.Frame):
     PROC_WIDTH = 192
     PROC_HEIGHT = 144
     
-    def __init__(self, parent, on_angle_change=None, **kwargs):
+    def __init__(self, parent, on_angle_change=None, on_frame_ready=None, **kwargs):
         super().__init__(parent, bg=COLORS['bg_dark'], **kwargs)
         self.on_angle_change = on_angle_change
+        self.on_frame_ready = on_frame_ready
+        self.on_canvas_click = None # Callback(x, y) 
         self.cap = None
         self.running = False
         self.current_camera = None
         self.body_segmenter = None
         self.body_x = 0.5
         self.body_detected = False
+        self._calib_points = [] # List of (x, y) in image coords
+        self.homography = None # cv2 homography matrix
         
         # Thread-safe queues for dual-pipeline architecture
         self._frame_queue = queue.Queue(maxsize=1)  # Always freshest frame
@@ -61,9 +65,7 @@ class CameraPanel(tk.Frame):
         """Auto-start camera 1 if available, else camera 0"""
         cameras = self.camera_combo['values']
         if cameras and isinstance(cameras, (list, tuple)):
-            if len(cameras) > 1:
-                self.camera_combo.set(cameras[1])
-            else:
+            if len(cameras) > 0:
                 self.camera_combo.set(cameras[0])
         self._start_camera()
     
@@ -97,6 +99,7 @@ class CameraPanel(tk.Frame):
         # Video display canvas
         self.video_canvas = tk.Canvas(self, bg='#000000', highlightthickness=0)
         self.video_canvas.pack(fill='both', expand=True, padx=5, pady=5)
+        self.video_canvas.bind('<Button-1>', self._handle_click)
         
         # Info overlay frame
         info_frame = tk.Frame(self, bg=COLORS['bg_medium'])
@@ -270,9 +273,9 @@ class CameraPanel(tk.Frame):
             self.start_btn._draw()
         
         if self.tracking_status:
-            self.tracking_status.config(text="Status: Stopped", fg=COLORS['text_dim'])
+            self.tracking_status.config(text="Status: Stopped", fg=COLORS['text_secondary'])
         if self.position_label:
-            self.position_label.config(text="Position: --", fg=COLORS['text_dim'])
+            self.position_label.config(text="Position: --", fg=COLORS['text_secondary'])
         
         # Clear canvas
         if self.video_canvas:
@@ -281,7 +284,7 @@ class CameraPanel(tk.Frame):
             self.video_canvas.create_text(
                 96, 72,
                 text="CAMERA OFF", 
-                fill=COLORS['text_dim'],
+                fill=COLORS['text_secondary'],
                 font=('Segoe UI', 10, 'bold')
             )
         if hasattr(self, '_canvas_img_id'):
@@ -380,6 +383,22 @@ class CameraPanel(tk.Frame):
                     
                     if mask_sum > body_threshold:
                         body_detected = True
+                        
+                        # Calculate raw Center of Gravity (average X)
+                        coords = np.where(seg_mask > 50)
+                        if len(coords[1]) > 0:
+                            raw_x = np.mean(coords[1])
+                            raw_y = np.mean(coords[0])
+                            
+                            # Apply Calibration Mapping if available
+                            if self.homography is not None:
+                                # Transform camera pixels to LED space (0-32, 0-64)
+                                lx, ly = self._transform_point(raw_x, raw_y)
+                                # Map to 0-1 range within the LED wall
+                                self.body_x = max(0, min(1.0, lx / 32.0))
+                            else:
+                                # Standard mapping (relative to full frame)
+                                self.body_x = raw_x / w
                 
                 # Update shared state for display
                 self.body_detected = body_detected
@@ -397,28 +416,10 @@ class CameraPanel(tk.Frame):
                 if body_detected and seg_mask is not None:
                     if getattr(self, 'tracking_sync_mode', False):
                         # 🔗 Synchronized Movement Mode
-                        # Calculate Center of Gravity (average X)
-                        coords = np.where(seg_mask > 50)
-                        if len(coords[1]) > 0:
-                            x_center = np.mean(coords[1]) / w
-                            
-                            # Amplified mapping: 
-                            # Map central 40% (0.3 to 0.7) of frame to full 180 degree motor range
-                            # This increases sensitivity (2.5x) so small movements move motors more.
-                            mapped_x = (x_center - 0.3) / 0.4
-                            
-                            # Apply Invert
-                            if getattr(self, 'tracking_invert', False):
-                                mapped_x = 1.0 - mapped_x
-                                
-                            # Convert to angle 0-180
-                            angle = int(mapped_x * 180)
-                            angle = max(0, min(180, angle))
-                            
-                            # All motors move together
-                            motor_angles = [angle] * 64
-                            if self.on_angle_change:
-                                self.on_angle_change(motor_angles)
+                        # Use the already calculated/transformed self.body_x
+                        x_center = self.body_x
+                        
+                        # Amplified mapping: 
                     else:
                         # 👤 Independent Silhouette Mode
                         # Apply Horizontal Flip to mask if Invert is enabled
@@ -498,6 +499,24 @@ class CameraPanel(tk.Frame):
                 
                 self._render_frame(frame)
                 self._update_tracking_ui_fast(self.body_detected)
+                
+                # External callback for LED processing
+                if self.on_frame_ready:
+                    self.on_frame_ready(frame)
+                    
+                # Overlay calibration points if active
+                if self._calib_points:
+                    for i, (px, py) in enumerate(self._calib_points):
+                        # px, py are 0-1 normalized
+                        cv2.circle(frame, (int(px*w), int(py*h)), 4, (0, 255, 255), -1)
+                        cv2.putText(frame, str(i+1), (int(px*w)+5, int(py*h)-5), 
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
+                    
+                    if len(self._calib_points) == 4:
+                        pts = np.array([[int(p[0]*w), int(p[1]*h)] for p in self._calib_points])
+                        cv2.polylines(frame, [pts], True, (0, 255, 255), 2)
+                
+                self._render_frame(frame)
         
         except Exception as e:
             logger.error(f"Display error: {e}")
@@ -570,6 +589,48 @@ class CameraPanel(tk.Frame):
         """Legacy method"""
         self._update_tracking_ui_fast(self.body_detected)
     
+    def set_calib_points(self, points):
+        """Points should be list of (x, y) normalized 0-1"""
+        self._calib_points = points
+
+    def _handle_click(self, event):
+        """Convert canvas click to normalized image coordinates"""
+        if not self.running or not self.on_canvas_click:
+            return
+            
+        cw = self.video_canvas.winfo_width()
+        ch = self.video_canvas.winfo_height()
+        
+        # In _render_frame we center the image
+        # We need the scaling factors used there
+        frame_w, frame_h = self.PROC_WIDTH, self.PROC_HEIGHT
+        scale = min(cw / frame_w, ch / frame_h)
+        new_w = frame_w * scale
+        new_h = frame_h * scale
+        
+        offset_x = (cw - new_w) / 2
+        offset_y = (ch - new_h) / 2
+        
+        # Relative to image
+        img_x = event.x - offset_x
+        img_y = event.y - offset_y
+        
+        if 0 <= img_x <= new_w and 0 <= img_y <= new_h:
+            norm_x = img_x / new_w
+            norm_y = img_y / new_h
+            self.on_canvas_click(norm_x, norm_y)
+
+    def set_homography(self, matrix):
+        """Set the 4x4 homography matrix from VisualVerifier"""
+        self.homography = matrix
+
+    def _transform_point(self, x, y):
+        """Map camera pixels (x,y) to LED space using homography"""
+        # x, y are PROC pixels
+        p = np.array([[[x, y]]], dtype=np.float32)
+        p_transformed = cv2.perspectiveTransform(p, self.homography)
+        return p_transformed[0][0] # Returns [lx, ly]
+
     def stop(self):
         """Cleanup"""
         self._stop_camera()

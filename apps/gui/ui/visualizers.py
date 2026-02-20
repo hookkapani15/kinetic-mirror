@@ -184,3 +184,89 @@ class MotorVisualizer(tk.Canvas):
     
     def draw_motors(self):
         self._draw()
+
+class LEDSimulatorVisualizer(tk.Canvas):
+    """32x64 pixel grid simulation for LED Wall"""
+    def __init__(self, parent, width=32, height=64, pixel_size=6, **kwargs):
+        super().__init__(parent, bg='black', highlightthickness=0, **kwargs)
+        self.width_leds = width
+        self.height_leds = height
+        self.pixel_size = pixel_size
+        self.led_state = [0] * (width * height)
+        # Pre-calc coords for speed? Maybe. Tkinter is slow with 2048 rectangles.
+        # We'll use a bitmap image for performance instead of 2000 rectangles.
+        self.image = None
+        self.photo = None
+        
+        # Initial draw
+        self._items_created = False
+        self._scale = 1.0
+        self._offset_x = 0
+        self._offset_y = 0
+        self.bind('<Configure>', self._on_resize)
+
+    def _on_resize(self, event):
+        # Recalculate scale and offsets to center the 32x64 wall
+        w = event.width
+        h = event.height
+        if w > 1 and h > 1:
+            # Maintain 1:2 ratio (32x64)
+            self._scale = min(w / self.width_leds, h / self.height_leds)
+            
+            # Calculate centering offsets
+            view_w = self.width_leds * self._scale
+            view_h = self.height_leds * self._scale
+            self._offset_x = (w - view_w) / 2
+            self._offset_y = (h - view_h) / 2
+            self._draw()
+
+    def update_leds(self, led_data):
+        """Update display from flat list of brightness values (0-255)"""
+        if not led_data: return
+        
+        self.delete('all')
+        
+        try:
+            import PIL.Image, PIL.ImageTk
+            import numpy as np
+            
+            # Convert list to numpy array
+            arr = np.array(led_data, dtype=np.uint8).reshape((self.height_leds, self.width_leds))
+            
+            # Create RGB image (Green for active, Black for inactive)
+            rgb = np.zeros((self.height_leds, self.width_leds, 3), dtype=np.uint8)
+            rgb[..., 1] = arr  # Green channel = brightness
+            
+            img = PIL.Image.fromarray(rgb)
+            # Use smooth scaling to target size
+            target_w = int(self.width_leds * self._scale)
+            target_h = int(self.height_leds * self._scale)
+            
+            if target_w > 0 and target_h > 0:
+                img = img.resize((target_w, target_h), PIL.Image.NEAREST)
+                self.photo = PIL.ImageTk.PhotoImage(image=img)
+                self.create_image(self._offset_x, self._offset_y, image=self.photo, anchor='nw')
+            
+        except ImportError:
+            # Fallback to rectangles if no PIL/numpy 
+            px = self._scale
+            off_x, off_y = self._offset_x, self._offset_y
+            for i, val in enumerate(led_data):
+                if val < 10: continue
+                y = i // self.width_leds
+                x = i % self.width_leds
+                self.create_rectangle(
+                    off_x + x*px, off_y + y*px, 
+                    off_x + (x+1)*px, off_y + (y+1)*px,
+                    fill=f'#00{val:02x}00', outline=''
+                )
+        except Exception as e:
+            pass
+
+    def _draw(self):
+        self.delete('all')
+        # Background text if no data
+        self.create_text(
+            self.winfo_width() // 2, self.winfo_height() // 2,
+            text="SIMULATOR ACTIVE", fill='#333', font=('Segoe UI', 10, 'bold')
+        )

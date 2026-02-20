@@ -27,8 +27,9 @@ LED Branch v2.0 - Optimized for dance tracking
 #include <Wire.h>
 
 // ==================== WIFI CONFIGURATION ====================
-const char *ssid = "ACT_2563";
-const char *password = "loki@1234";
+#include "secrets.h"
+const char *ssid = WIFI_SSID;
+const char *password = WIFI_PASS;
 
 // ==================== LED CONFIGURATION ====================
 #define LED_PIN_LEFT 5

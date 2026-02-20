@@ -6,12 +6,9 @@ This directory contains ESP32-S3 firmware with comprehensive testing, power moni
 ## Files
 
 ### Firmware Source
+- `firmware/esp32/mirror-prod-animation_esp32/mirror-prod-animation_esp32.ino` - Canonical firmware (LED+Servo)
+- `firmware/esp32/mirror-prod-animation_esp32/secrets.h` - Credentials (gitignored)
 - `firmware/esp32/tests/unit_tests.cpp` - Unity test framework for ESP32
-- `firmware/esp32/include/led_controller.h` - LED controller header
-- `firmware/esp32/include/motor_controller.h` - Motor controller header
-- `firmware/esp32/include/serial_protocol.h` - Serial protocol header
-- `firmware/esp32/include/power_monitor.h` - Power monitoring
-- `firmware/esp32/include/brightness_optimizer.h` - Adaptive brightness
 
 ### Test Tools
 - `tools/test_esp32.py` - Automated Python test script
@@ -40,7 +37,7 @@ python tools/test_esp32.py --port COM3 --power     # Power tests
 
 ## Optimizations (Reversible)
 
-Edit `firmware/esp32/src/main.cpp` to enable/disable optimizations:
+Edit `firmware/esp32/mirror-prod-animation_esp32/mirror-prod-animation_esp32.ino` to enable/disable optimizations:
 
 ```cpp
 // Uncomment to ENABLE:

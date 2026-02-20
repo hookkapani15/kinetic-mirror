@@ -1,0 +1,23 @@
+{
+    "display": {
+        "width": 32,
+        "height": 64,
+        "mapping_mode": 3,
+        "pixel_size": 3
+    },
+    "hardware": {
+        "com_port": "COM7",
+        "baud_rate": 115200,
+        "left_pin_panels": [1, 3, 5, 7],
+        "right_pin_panels": [2, 4, 6, 8]
+    },
+    "calibration": {
+        "auto_thresholds": [0, 150, 100, 60, 30],
+        "blur_size": 11
+    },
+    "logging": {
+        "level": "INFO",
+        "max_size_mb": 5,
+        "backup_count": 3
+    }
+}

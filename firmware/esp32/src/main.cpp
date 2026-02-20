@@ -1,20 +1,20 @@
-#include <Arduino.h>
 /*
 ======================================================================================
-MIRROR PROD ANIMATION - ESP32S3 UNIFIED CONTROLLER
+DANCE MIRROR - ESP32S3 LED CONTROLLER
 ======================================================================================
-Combined body visualization (LEDs) + hand-controlled servos (mechanical mirror)
+Real-time body silhouette display on LED matrix
 
 Hardware:
 - ESP32S3 DevKit
-- 32x64 WS2812B LED Matrix on GPIO 5 & 18 (Body visualization)
-- PCA9685 + 6 Servos on I2C (Hand control)
+- 32x64 WS2812B LED Matrix on GPIO 5 & 18
 
 Communication: 460800 baud
-- LED Packet: 0xAA 0xBB 0x01 + 2048 bytes (body pose)
-- Servo Packet: 0xAA 0xBB 0x02 + 12 bytes (hand angles)
+- LED Full:  0xAA 0xBB 0x01 + 2048 bytes (8-bit brightness)
+- LED 1-bit: 0xAA 0xBB 0x03 + 256 bytes  (packed 1-bit, 8x smaller!)
+- PING:      0xAA 0xBB 0x05 -> responds "PONG"
+- INFO:      0xAA 0xBB 0x06 -> responds device info
 
-Created: 2025-11-25
+LED Branch v2.0 - Optimized for dance tracking
 ======================================================================================
 */
 
@@ -27,8 +27,9 @@ Created: 2025-11-25
 #include <Wire.h>
 
 // ==================== WIFI CONFIGURATION ====================
-const char *ssid = "ACT_2563";
-const char *password = "loki@1234";
+#include "secrets.h"
+const char *ssid = WIFI_SSID;
+const char *password = WIFI_PASS;
 
 // ==================== LED CONFIGURATION ====================
 #define LED_PIN_LEFT 5
@@ -42,25 +43,27 @@ const char *password = "loki@1234";
 #define PANEL_H 16
 
 // ==================== SERVO CONFIGURATION ====================
-#define NUM_SERVOS 64       // 64 servos (4x PCA9685 boards)
+#define NUM_SERVOS 32       // 32 servos (2x PCA9685 boards)
 #define PCA9685_ADDR_1 0x40 // First PCA9685 (servos 0-15)
 #define PCA9685_ADDR_2 0x41 // Second PCA9685 (servos 16-31)
-#define PCA9685_ADDR_3 0x42 // Third PCA9685 (servos 32-47)
-#define PCA9685_ADDR_4 0x43 // Fourth PCA9685 (servos 48-63)
 #define SERVO_FREQ 50
 #define OSC_FREQ 27000000
 
 #define PWM_MIN 250
 #define PWM_MAX 470
-#define SMOOTH_ALPHA 1.0    // Optimized: 1.0 = instant response (no smoothing lag)
+#define SMOOTH_ALPHA 0.3
 
 // ==================== SERIAL PROTOCOL ====================
 #define BAUD_RATE 460800
-#define PACKET_LED_SIZE 2051 // Header(2) + Type(1) + Data(2048)
-#define PACKET_SERVO_SIZE 131 // Header(2) + Type(1) + ServoData(128) for 64 servos
+#define PACKET_LED_SIZE 2051      // Header(2) + Type(1) + Data(2048)
+#define PACKET_LED_1BIT_SIZE 259  // Header(2) + Type(1) + Data(256) - 1-bit packed
+#define PACKET_SERVO_SIZE 67      // Header(2) + Type(1) + ServoData(64) for 32 servos
 
-#define PKT_TYPE_LED 0x01
-#define PKT_TYPE_SERVO 0x02
+#define PKT_TYPE_LED 0x01         // Full 8-bit brightness
+#define PKT_TYPE_SERVO 0x02       // Servo angles (legacy)
+#define PKT_TYPE_LED_1BIT 0x03    // 1-bit packed LEDs (8x smaller!)
+#define PKT_TYPE_PING 0x05        // Connection test -> responds PONG
+#define PKT_TYPE_INFO 0x06        // Device info request
 
 // ==================== GLOBALS ====================
 CRGB leds_left[LEDS_PER_PIN];
@@ -68,8 +71,6 @@ CRGB leds_right[LEDS_PER_PIN];
 
 Adafruit_PWMServoDriver pwm1 = Adafruit_PWMServoDriver(PCA9685_ADDR_1);
 Adafruit_PWMServoDriver pwm2 = Adafruit_PWMServoDriver(PCA9685_ADDR_2);
-Adafruit_PWMServoDriver pwm3 = Adafruit_PWMServoDriver(PCA9685_ADDR_3);
-Adafruit_PWMServoDriver pwm4 = Adafruit_PWMServoDriver(PCA9685_ADDR_4);
 float servoPositions[NUM_SERVOS];
 float targetPositions[NUM_SERVOS];
 
@@ -112,15 +113,12 @@ void setServoAngle(uint8_t id, float angle) {
 
   uint16_t pwm_value = angleToPWM(servoPositions[id]);
 
-  // Route to correct PCA9685 board (4 boards, 16 channels each)
+  // Route to correct PCA9685 board
   if (id < 16) {
-    pwm1.setPWM(id, 0, pwm_value);      // Board 1: servos 0-15
-  } else if (id < 32) {
-    pwm2.setPWM(id - 16, 0, pwm_value); // Board 2: servos 16-31
-  } else if (id < 48) {
-    pwm3.setPWM(id - 32, 0, pwm_value); // Board 3: servos 32-47
+    pwm1.setPWM(id, 0, pwm_value); // First board: servos 0-15
   } else {
-    pwm4.setPWM(id - 48, 0, pwm_value); // Board 4: servos 48-63
+    pwm2.setPWM(id - 16, 0,
+                pwm_value); // Second board: servos 16-31 (offset by 16)
   }
 }
 
@@ -208,6 +206,59 @@ void processLEDPacket() {
   }
 }
 
+// Process 1-bit packed LED packet (256 bytes = 2048 bits)
+void processLED1BitPacket() {
+  if (packetBuffer[0] == 0xAA && packetBuffer[1] == 0xBB &&
+      packetBuffer[2] == PKT_TYPE_LED_1BIT) {
+    uint8_t *packed = &packetBuffer[3];
+    
+    uint16_t ledIdx = 0;
+    for (uint16_t byteIdx = 0; byteIdx < 256 && ledIdx < NUM_LEDS; byteIdx++) {
+      uint8_t byte = packed[byteIdx];
+      // MSB first: bit 7 is first LED in each byte
+      for (int8_t bit = 7; bit >= 0 && ledIdx < NUM_LEDS; bit--) {
+        bool on = (byte & (1 << bit)) != 0;
+        
+        if (on) {
+          if (ledIdx < LEDS_PER_PIN) {
+            leds_left[ledIdx] = CRGB(255, 255, 255);
+          } else {
+            leds_right[ledIdx - LEDS_PER_PIN] = CRGB(255, 255, 255);
+          }
+        } else {
+          if (ledIdx < LEDS_PER_PIN) {
+            leds_left[ledIdx] = CRGB::Black;
+          } else {
+            leds_right[ledIdx - LEDS_PER_PIN] = CRGB::Black;
+          }
+        }
+        ledIdx++;
+      }
+    }
+    
+    FastLED.show();
+    lastLEDPacket = millis();
+    frameCount++;
+  }
+}
+
+// Handle PING request - respond with PONG
+void processPing() {
+  Serial.println("PONG");
+  Serial.flush();
+}
+
+// Handle INFO request - respond with device capabilities
+void processInfo() {
+  Serial.println("MIRROR-LED-ESP32S3");
+  Serial.println("VERSION:2.0");
+  Serial.println("LEDS:2048");
+  Serial.println("SIZE:32x64");
+  Serial.println("PACKETS:01,03");
+  Serial.println("OK");
+  Serial.flush();
+}
+
 void processServoPacket() {
   if (packetBuffer[0] == 0xAA && packetBuffer[1] == 0xBB &&
       packetBuffer[2] == PKT_TYPE_SERVO) {
@@ -251,41 +302,27 @@ void setup() {
     delay(100);
   }
 
-  // Servos (4x PCA9685 for 64 servos)
-  Serial.println("Init servos (64 channels, 4 boards)...");
-  // Use custom I2C pins: SDA=GPIO18, SCL=GPIO19
-  Wire.begin(18, 19);  // SDA=D18, SCL=D19
-  Wire.setClock(400000); // Optimized: 400kHz Fast Mode
+  // Servos (dual PCA9685 for 32 servos)
+  Serial.println("Init servos (32 channels)...");
+  Wire.begin();
 
-  // Initialize all 4 PCA9685 boards
+  // Initialize first PCA9685 (servos 0-15)
   pwm1.begin();
   pwm1.setOscillatorFrequency(OSC_FREQ);
   pwm1.setPWMFreq(SERVO_FREQ);
-  Serial.println("  PCA9685 #1 (0x40): OK");
 
+  // Initialize second PCA9685 (servos 16-31)
   pwm2.begin();
   pwm2.setOscillatorFrequency(OSC_FREQ);
   pwm2.setPWMFreq(SERVO_FREQ);
-  Serial.println("  PCA9685 #2 (0x41): OK");
-
-  pwm3.begin();
-  pwm3.setOscillatorFrequency(OSC_FREQ);
-  pwm3.setPWMFreq(SERVO_FREQ);
-  Serial.println("  PCA9685 #3 (0x42): OK");
-
-  pwm4.begin();
-  pwm4.setOscillatorFrequency(OSC_FREQ);
-  pwm4.setPWMFreq(SERVO_FREQ);
-  Serial.println("  PCA9685 #4 (0x43): OK");
 
   centerAllServos();
   delay(500);
 
-  // Servo test - quick sweep (faster for 64 servos)
-  Serial.println("Testing all 64 servos...");
+  // Servo test
   for (uint8_t i = 0; i < NUM_SERVOS; i++) {
     setServoAngle(i, 120);
-    delay(20);  // Faster delay for 64 servos
+    delay(100);
   }
   delay(200);
   centerAllServos();
@@ -301,8 +338,10 @@ void setup() {
 
   Serial.println("\nREADY! Waiting for data...");
   Serial.println("Packet Types:");
-  Serial.println("  0x01 = Body/LED (2051 bytes)");
-  Serial.println("  0x02 = Hand/Servo (67 bytes)");
+  Serial.println("  0x01 = LED Full (2051 bytes)");
+  Serial.println("  0x03 = LED 1-bit (259 bytes) - OPTIMIZED");
+  Serial.println("  0x05 = PING -> PONG");
+  Serial.println("  0x06 = INFO -> device info");
   Serial.println();
 
   lastFPSUpdate = millis();
@@ -342,9 +381,22 @@ void loop() {
       }
     } else if (packetIndex == 2) {
       // Packet type
-      if (inByte == PKT_TYPE_LED || inByte == PKT_TYPE_SERVO) {
+      if (inByte == PKT_TYPE_LED || inByte == PKT_TYPE_SERVO || 
+          inByte == PKT_TYPE_LED_1BIT || inByte == PKT_TYPE_PING || 
+          inByte == PKT_TYPE_INFO) {
         currentPacketType = inByte;
         packetBuffer[packetIndex++] = inByte;
+        
+        // Handle immediate response packets (no data payload)
+        if (inByte == PKT_TYPE_PING) {
+          processPing();
+          packetIndex = 0;
+          currentPacketType = 0;
+        } else if (inByte == PKT_TYPE_INFO) {
+          processInfo();
+          packetIndex = 0;
+          currentPacketType = 0;
+        }
       } else {
         // Unknown type, reset
         packetIndex = 0;
@@ -353,9 +405,9 @@ void loop() {
     } else if (packetIndex > 2) {
       // Bounds guard to prevent buffer overrun on malformed packets
       uint16_t maxSize = (currentPacketType == PKT_TYPE_LED) ? PACKET_LED_SIZE
-                         : (currentPacketType == PKT_TYPE_SERVO)
-                             ? PACKET_SERVO_SIZE
-                             : PACKET_LED_SIZE; // fallback largest
+                         : (currentPacketType == PKT_TYPE_SERVO) ? PACKET_SERVO_SIZE
+                         : (currentPacketType == PKT_TYPE_LED_1BIT) ? PACKET_LED_1BIT_SIZE
+                         : PACKET_LED_SIZE; // fallback largest
       if (packetIndex >= maxSize) {
         packetIndex = 0;
         currentPacketType = 0;
@@ -370,6 +422,9 @@ void loop() {
       } else if (currentPacketType == PKT_TYPE_SERVO &&
                  packetIndex >= PACKET_SERVO_SIZE) {
         complete = true;
+      } else if (currentPacketType == PKT_TYPE_LED_1BIT &&
+                 packetIndex >= PACKET_LED_1BIT_SIZE) {
+        complete = true;
       }
 
       if (complete) {
@@ -377,6 +432,8 @@ void loop() {
           processLEDPacket();
         } else if (currentPacketType == PKT_TYPE_SERVO) {
           processServoPacket();
+        } else if (currentPacketType == PKT_TYPE_LED_1BIT) {
+          processLED1BitPacket();
         }
         packetIndex = 0;
         currentPacketType = 0;
@@ -413,5 +470,5 @@ void loop() {
     lastFPSUpdate = millis();
   }
 
-  // No loop delay for maximum performance
+  delay(5);
 }

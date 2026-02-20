@@ -15,10 +15,19 @@ A high-performance kinetic sculpture control system utilizing real-time body sil
    ```
 
 3. **Run Application**
-   Double-click `run.bat` or run:
-   ```bash
-   python -m apps.gui.main
-   ```
+   - **LED Matrix (32x64 Wall)**: Double-click `run_led.bat` or run:
+     ```bash
+     python -m apps.gui.main_led
+     ```
+   - **Motor Sculpture (8x8 Grid)**: Double-click `run.bat` or run:
+     ```bash
+     python -m apps.gui.main
+     ```
+
+## ⚙️ Configuration
+The system configuration is stored in `config/settings.json`.
+- `display`: Width, height, and mapping mode (use `3` for COLUMN_SERPENTINE).
+- `hardware`: Serial port (e.g., `COM7`) and baud rate.
 
 ## 🎮 Features
 

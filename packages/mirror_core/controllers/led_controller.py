@@ -20,6 +20,12 @@ MAPPING MODES:
 
 import numpy as np
 import cv2
+import struct
+try:
+    from ..utils.crc import crc16_ccitt
+except ImportError:
+    # Fallback if utils not found (e.g. running standalone)
+    def crc16_ccitt(data): return 0
 
 
 class LEDController:
@@ -94,7 +100,47 @@ class LEDController:
                         print(f"[LEDController] Mapping: {self.panel_mapping}")
                         return
                 except Exception as e:
-                    print(f"[LEDController] Failed to load mapping: {e}")
+                        print(f"[LEDController] Failed to load mapping: {e}")
+
+    def get_panel_rect(self, panel_index):
+        """
+        Get the bounding box (x, y, w, h) for a specific logical panel (0-7).
+        Panel Layout (0-7):
+        0 1
+        2 3
+        4 5
+        6 7
+        """
+        if not (0 <= panel_index < 8):
+            raise ValueError("Panel index must be 0-7")
+            
+        row = panel_index // 2
+        col = panel_index % 2
+        
+        x = col * self.PANEL_WIDTH
+        y = row * self.PANEL_HEIGHT
+        
+        return (x, y, self.PANEL_WIDTH, self.PANEL_HEIGHT)
+
+    def draw_on_panel(self, frame, panel_index, draw_func):
+        """
+        Execute drawing operations on a specific panel's ROI.
+        
+        Args:
+            frame: The full 32x64 frame to draw on
+            panel_index: Index of the panel (0-7)
+            draw_func: Function that accepts an ROI (numpy slice) as argument
+                       e.g. lambda roi: roi[:] = 255
+        """
+        x, y, w, h = self.get_panel_rect(panel_index)
+        
+        # Extract ROI (Region of Interest)
+        # Note: numpy uses [y:y+h, x:x+w]
+        roi = frame[y:y+h, x:x+w]
+        
+        # Execute drawing function on this slice
+        # The slice is a view, so modifying it modifies original frame
+        draw_func(roi)
 
     def remap_for_hardware(self, frame):
         """
@@ -164,68 +210,69 @@ class LEDController:
     
     def _remap_column_split(self, frame, serpentine=True):
         """
-        Remap for column-based pin split:
-        - Left column (panels 1,3,5,7) → indices 0-1023
-        - Right column (panels 2,4,6,8) → indices 1024-2047
+        Remap for column-based pin split.
         
-        Within each panel, rows may be serpentine (alternate direction)
+        Firmware data layout (row-major in 32-wide frame):
+          - Flat indices 0-1023  (rows 0-31)  → GPIO 5  → left physical column
+          - Flat indices 1024-2047 (rows 32-63) → GPIO 18 → right physical column
+        
+        Each physical column is 64 tall × 16 wide (4 panels of 16×16).
+        The firmware reads 32 pixels per row, but each physical column is only
+        16 wide, so 2 consecutive physical rows get packed into each 32-pixel
+        output row.
+        
+        Output layout (rows 0-31 = left column):
+          Row 0:  [left_panel1_physRow0 (16px)] [left_panel1_physRow1 (16px)]
+          Row 1:  [left_panel1_physRow2 (16px)] [left_panel1_physRow3 (16px)]
+          ...
+          Row 7:  [left_panel1_physRow14]       [left_panel1_physRow15]
+          Row 8:  [left_panel3_physRow0]        [left_panel3_physRow1]
+          ...
+          Row 31: [left_panel7_physRow14]       [left_panel7_physRow15]
+
+        Output layout (rows 32-63 = right column):
+          Same structure for right_pin_panels.
         """
         output = np.zeros((self.height, self.width), dtype=np.uint8)
         
-        # Process left column (x: 0-15) → first half of output
-        for panel_idx, panel_num in enumerate(self.left_pin_panels):
-            src_row = (panel_num - 1) // 2  # Source panel row
-            src_col = (panel_num - 1) % 2   # Should be 0 for left panels
-            
-            src_y_start = src_row * self.PANEL_HEIGHT
-            src_x_start = src_col * self.PANEL_WIDTH
-            
-            # Destination is sequential panels in first half
-            dst_y_start = panel_idx * self.PANEL_HEIGHT
-            dst_x_start = 0
-            
-            for local_y in range(self.PANEL_HEIGHT):
-                for local_x in range(self.PANEL_WIDTH):
-                    src_y = src_y_start + local_y
-                    src_x = src_x_start + local_x
+        def pack_column(pin_panels, output_row_offset):
+            """Pack 4 panels (64×16 physical) into 32 output rows (32 wide each)."""
+            for panel_idx, panel_num in enumerate(pin_panels):
+                # Source: where this panel lives in the logical frame
+                src_row = (panel_num - 1) // 2  # Panel row (0-3)
+                src_col = (panel_num - 1) % 2   # Panel col (0=left, 1=right)
+                src_y_start = src_row * self.PANEL_HEIGHT
+                src_x_start = src_col * self.PANEL_WIDTH
+                
+                # Each panel has 16 physical rows of 16 pixels.
+                # Two physical rows pack into one 32-wide output row.
+                # So 16 physical rows → 8 output rows per panel.
+                for local_y in range(self.PANEL_HEIGHT):
+                    # Which output row does this physical row go to?
+                    # panel_idx * 8 = base output row for this panel
+                    # local_y // 2 = which pair of physical rows
+                    dst_row = output_row_offset + panel_idx * 8 + (local_y // 2)
                     
-                    # Apply serpentine if needed
-                    if serpentine and (local_y & 1):  # Odd rows reversed
-                        dst_local_x = (self.PANEL_WIDTH - 1) - local_x
-                    else:
-                        dst_local_x = local_x
+                    # Even physical rows go to left half (x=0-15)
+                    # Odd physical rows go to right half (x=16-31) 
+                    x_offset = 0 if (local_y % 2 == 0) else 16
                     
-                    dst_y = dst_y_start + local_y
-                    dst_x = dst_x_start + dst_local_x
-                    
-                    output[dst_y, dst_x] = frame[src_y, src_x]
+                    for local_x in range(self.PANEL_WIDTH):
+                        src_y = src_y_start + local_y
+                        src_x = src_x_start + local_x
+                        
+                        # Apply serpentine within panel if needed
+                        if serpentine and (local_y & 1):  # Odd rows reversed
+                            dst_x = x_offset + (self.PANEL_WIDTH - 1 - local_x)
+                        else:
+                            dst_x = x_offset + local_x
+                        
+                        output[dst_row, dst_x] = frame[src_y, src_x]
         
-        # Process right column (x: 16-31) → second half of output (y: 0-63, x: 16-31)
-        for panel_idx, panel_num in enumerate(self.right_pin_panels):
-            src_row = (panel_num - 1) // 2
-            src_col = (panel_num - 1) % 2  # Should be 1 for right panels
-            
-            src_y_start = src_row * self.PANEL_HEIGHT
-            src_x_start = src_col * self.PANEL_WIDTH
-            
-            # Destination is sequential panels in second half (starts at x=16)
-            dst_y_start = panel_idx * self.PANEL_HEIGHT
-            dst_x_start = 16
-            
-            for local_y in range(self.PANEL_HEIGHT):
-                for local_x in range(self.PANEL_WIDTH):
-                    src_y = src_y_start + local_y
-                    src_x = src_x_start + local_x
-                    
-                    if serpentine and (local_y & 1):
-                        dst_local_x = (self.PANEL_WIDTH - 1) - local_x
-                    else:
-                        dst_local_x = local_x
-                    
-                    dst_y = dst_y_start + local_y
-                    dst_x = dst_x_start + dst_local_x
-                    
-                    output[dst_y, dst_x] = frame[src_y, src_x]
+        # Left column panels → output rows 0-31
+        pack_column(self.left_pin_panels, 0)
+        # Right column panels → output rows 32-63  
+        pack_column(self.right_pin_panels, 32)
         
         return output
     
@@ -399,6 +446,144 @@ class LEDController:
         rle_len = len(rle)
         packet = bytes([0xAA, 0xBB, 0x04, (rle_len >> 8) & 0xFF, rle_len & 0xFF]) + bytes(rle)
         return packet
+
+    def pack_led_packet_1bit_crc(self, led_frame, frame_id: int):
+        """
+        Pack 1-bit LED packet with CRC and Frame ID for integrity.
+        Structure:
+          [AA BB 07] [FrameID(2)] [Data(256)] [CRC(2)]
+          Total: 3 + 2 + 256 + 2 = 263 bytes
+          (Type 0x07 = 1-bit + CRC)
+        """
+        # reusing logic from pack_led_packet_1bit but modifying resizing/packing
+        if led_frame.shape[:2] != (self.height, self.width):
+             # Resize/Threshold on the fly if needed
+             if led_frame.ndim == 3: led_frame = led_frame.max(axis=2)
+             led_frame = cv2.resize(led_frame, (self.width, self.height), interpolation=cv2.INTER_NEAREST)
+
+        # Threshold to binary
+        binary = (led_frame > 128).astype(np.uint8)
+        flat = binary.flatten()
+        
+        # Pack 8 pixels per byte
+        packed = bytearray(256)
+        # Fast packing using numpy
+        # Reshape to (256, 8)
+        # bit_weights = np.array([128, 64, 32, 16, 8, 4, 2, 1], dtype=np.uint8)
+        # This is getting complex to vectorise correctly with simple numpy without lookups
+        # Fallback to loop for safety (it's only 256 iterations)
+        
+        byte_idx = 0
+        for i in range(0, 2048, 8):
+            byte_val = 0
+            for bit in range(8):
+                if flat[i + bit]:
+                    byte_val |= (1 << (7 - bit))
+            packed[byte_idx] = byte_val
+            byte_idx += 1
+            
+        # Build payload for CRC calculation
+        # Payload = Type(1) + FrameID(2) + Data(256)
+        # Actually header is usually excluded from CRC in some protocols, 
+        # but here we'll include Type+ID+Data to be safe.
+        
+        type_byte = 0x07 # New type for CRC packet
+        fid_hi = (frame_id >> 8) & 0xFF
+        fid_lo = frame_id & 0xFF
+        
+        payload = bytearray([type_byte, fid_hi, fid_lo]) + packed
+        crc = crc16_ccitt(payload)
+        
+        packet = bytearray([0xAA, 0xBB]) + payload + bytearray([(crc >> 8) & 0xFF, crc & 0xFF])
+        return bytes(packet)
+
+    def pack_remapped_led_packet_1bit(self, remapped_frame):
+        """
+        Pack an ALREADY REMAPPED frame into 1-bit format (Type 0x03).
+        Compatible with firmware v2.0+.
+        
+        Args:
+            remapped_frame (np.array): 64x32 frame, already remapped for hardware
+        Returns:
+            bytes: 259-byte packet [0xAA, 0xBB, 0x03, 256 bytes data]
+        """
+        # Threshold to binary
+        if remapped_frame.max() > 1:
+            binary = (remapped_frame > 127).astype(np.uint8)
+        else:
+            binary = remapped_frame.astype(np.uint8)
+            
+        flat = binary.flatten()
+        
+        # Pack 8 pixels per byte (MSB first)
+        packed = bytearray(256)
+        byte_idx = 0
+        for i in range(0, min(len(flat), 2048), 8):
+            byte_val = 0
+            for bit in range(8):
+                if i + bit < len(flat) and flat[i + bit]:
+                    byte_val |= (1 << (7 - bit))
+            packed[byte_idx] = byte_val
+            byte_idx += 1
+        
+        return bytes([0xAA, 0xBB, 0x03]) + bytes(packed)
+
+    def pack_remapped_led_packet_1bit_crc(self, remapped_frame, frame_id: int):
+        """
+        Pack an ALREADY REMAPPED frame into 1-bit format with CRC.
+        USE THIS for "What You See Is What You Send" verification.
+        
+        Args:
+            remapped_frame (np.array): 32x64 frame, already remapped for hardware
+            frame_id (int): 16-bit frame ID
+        """
+        # Ensure binary (0 or 1)
+        # We assume input is already decent, but let's be safe
+        if remapped_frame.max() > 1:
+            threshold = 127
+            if remapped_frame.dtype == np.uint8:
+                 binary = (remapped_frame > threshold).astype(np.uint8)
+            else:
+                 binary = (remapped_frame > 0.5).astype(np.uint8)
+        else:
+            binary = remapped_frame.astype(np.uint8)
+            
+        flat = binary.flatten()
+        
+        # Pack 8 pixels per byte (MSB first)
+        # Firmware expects 256 bytes for 2048 LEDs
+        packed = bytearray(256)
+        
+        byte_idx = 0
+        pixel_idx = 0
+        max_pixels = 2048
+        
+        while pixel_idx < max_pixels and byte_idx < 256:
+            byte_val = 0
+            for bit in range(8):
+                if pixel_idx + bit < len(flat) and flat[pixel_idx + bit]:
+                    byte_val |= (1 << (7 - bit))
+            packed[byte_idx] = byte_val
+            byte_idx += 1
+            pixel_idx += 8
+            
+        # Build payload for CRC calculation
+        # Payload = Type(1) + FrameID(2) + Data(256)
+        # Type is 0x07
+        
+        type_byte = 0x07 
+        fid_hi = (frame_id >> 8) & 0xFF
+        fid_lo = frame_id & 0xFF
+        
+        payload = bytearray([type_byte, fid_hi, fid_lo]) + packed
+        
+        # Calculate CRC
+        from ..utils.crc import crc16_ccitt # Ensure import if not at top level, though it is
+        crc = crc16_ccitt(payload)
+        
+        # Construct final packet: Header(2) + Payload(259) + CRC(2)
+        packet = bytearray([0xAA, 0xBB]) + payload + bytearray([(crc >> 8) & 0xFF, crc & 0xFF])
+        return bytes(packet)
 
 
 # Quick test

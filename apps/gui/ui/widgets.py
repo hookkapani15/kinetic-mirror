@@ -77,3 +77,8 @@ class ModernButton(tk.Canvas):
     def set_text(self, text):
         self.text = text
         self._draw()
+
+    def set_color(self, color):
+        self.default_bg = color
+        self.current_bg = color
+        self._draw()

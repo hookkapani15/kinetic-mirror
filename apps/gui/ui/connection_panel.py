@@ -10,7 +10,7 @@ import subprocess
 
 from .theme import COLORS
 from .widgets import ModernButton
-from ..core.config import (
+from core.config import (
     FIRMWARE_BIN_ESP32, FIRMWARE_BIN_ESP32S3, 
     FLASH_LAYOUTS, has_any_firmware_binary,
     ESP32_S3_IDENTIFIERS
@@ -48,71 +48,59 @@ class ConnectionPanel(tk.Frame):
         self.monitor_thread.start()
 
     def _create_widgets(self):
-        title = tk.Label(self, text="🔌 ESP32-S3", 
-                        bg=COLORS['bg_medium'], fg=COLORS['text_primary'],
-                        font=('Segoe UI', 10, 'bold'))
-        title.pack(pady=(8, 10))
+        # Header Row: Port + Refresh + Connect + Flash
+        header_frame = tk.Frame(self, bg=COLORS['bg_medium'])
+        header_frame.pack(fill='x', padx=5, pady=5)
         
-        port_frame = tk.Frame(self, bg=COLORS['bg_medium'])
-        port_frame.pack(fill='x', padx=10)
+        tk.Label(header_frame, text="🔌", bg=COLORS['bg_medium'], 
+                 fg=COLORS['text_primary'], font=('Segoe UI', 10)).pack(side='left', padx=(2, 5))
         
         self.port_var = tk.StringVar()
-        self.port_combo = ttk.Combobox(port_frame, textvariable=self.port_var, 
-                                       width=15, state='readonly')
-        self.port_combo.pack(side='left', padx=(0, 5))
+        self.port_combo = ttk.Combobox(header_frame, textvariable=self.port_var, 
+                                       width=12, state='readonly')
+        self.port_combo.pack(side='left', padx=2)
         
-        refresh_btn = tk.Button(port_frame, text="⟳", command=self._refresh_ports,
+        refresh_btn = tk.Button(header_frame, text="⟳", command=self._refresh_ports,
                                bg=COLORS['bg_light'], fg=COLORS['text_primary'],
-                               font=('Segoe UI', 9), bd=0, padx=5, pady=1)
-        refresh_btn.pack(side='left')
-        
-        # Device info
-        self.device_info = tk.Label(self, text="", bg=COLORS['bg_medium'], 
-                                   fg=COLORS['text_secondary'], font=('Segoe UI', 7),
-                                   wraplength=160)
-        self.device_info.pack(pady=(5, 0))
-        
-        # Status
-        status_frame = tk.Frame(self, bg=COLORS['bg_medium'])
-        status_frame.pack(fill='x', padx=10, pady=(5, 5))
-        
-        self.status_indicator = tk.Canvas(status_frame, width=10, height=10, 
-                                          bg=COLORS['bg_medium'], highlightthickness=0)
-        self.status_indicator.pack(side='left')
-        self._draw_status_dot(False)
-        
-        self.status_label = tk.Label(status_frame, text="Disconnected", 
-                                     bg=COLORS['bg_medium'], fg=COLORS['text_secondary'],
-                                     font=('Segoe UI', 8))
-        self.status_label.pack(side='left', padx=(5, 0))
+                               font=('Segoe UI', 8), bd=0, padx=4, pady=1)
+        refresh_btn.pack(side='left', padx=2)
         
         # Connect button
-        self.connect_btn = ModernButton(self, text="Connect", 
+        self.connect_btn = ModernButton(header_frame, text="Connect", 
                                         command=self._toggle_connection,
-                                        width=90, height=28,
+                                        width=70, height=24,
                                         bg=COLORS['success'])
-        self.connect_btn.pack(pady=(5, 5))
+        self.connect_btn.pack(side='left', padx=2)
         
-        # Separator
-        sep = tk.Frame(self, bg=COLORS['grid_line'], height=1)
-        sep.pack(fill='x', padx=10, pady=5)
-        
-        # Firmware section
-        fw_title = tk.Label(self, text="⚡ FIRMWARE", 
-                   bg=COLORS['bg_medium'], fg=COLORS['text_primary'],
-                   font=('Segoe UI', 9, 'bold'))
-        fw_title.pack(pady=(5, 5))
-        # Firmware status
-        self.fw_status = tk.Label(self, text="", bg=COLORS['bg_medium'], 
-                     fg=COLORS['text_secondary'], font=('Segoe UI', 7),
-                     wraplength=160)
-        self.fw_status.pack()
-        # Flash button (create before _check_firmware)
-        self.flash_btn = ModernButton(self, text="🔥 Flash", 
+        # Flash button
+        self.flash_btn = ModernButton(header_frame, text="🔥 Flash", 
                   command=self._start_flash_instructions,
-                  width=90, height=28,
+                  width=65, height=24,
                   bg=COLORS['warning'])
-        self.flash_btn.pack(pady=(5, 2))
+        self.flash_btn.pack(side='left', padx=2)
+
+        # Status & Info Row
+        info_row = tk.Frame(self, bg=COLORS['bg_medium'])
+        info_row.pack(fill='x', padx=5, pady=(0, 2))
+        
+        self.status_indicator = tk.Canvas(info_row, width=8, height=8, 
+                                          bg=COLORS['bg_medium'], highlightthickness=0)
+        self.status_indicator.pack(side='left', padx=(5, 0))
+        self._draw_status_dot(False)
+        
+        self.status_label = tk.Label(info_row, text="Disconnected", 
+                                     bg=COLORS['bg_medium'], fg=COLORS['text_secondary'],
+                                     font=('Segoe UI', 8))
+        self.status_label.pack(side='left', padx=(5, 10))
+        
+        self.device_info = tk.Label(info_row, text="", bg=COLORS['bg_medium'], 
+                                   fg=COLORS['text_secondary'], font=('Segoe UI', 7))
+        self.device_info.pack(side='left')
+
+        # Firmware status (compact)
+        self.fw_status = tk.Label(self, text="", bg=COLORS['bg_medium'], 
+                     fg=COLORS['text_secondary'], font=('Segoe UI', 7))
+        self.fw_status.pack(pady=(0, 2))
         
         # Progress bar (hidden initially)
         self.progress_var = tk.DoubleVar()
@@ -160,16 +148,17 @@ class ConnectionPanel(tk.Frame):
         
         for attempt in range(max_retries):
             try:
-                ser = serial.Serial(port=port, baudrate=460800, timeout=1, write_timeout=1.0)
+                ser = serial.Serial(port=port, baudrate=460800, timeout=1, write_timeout=1.0, dsrdtr=True)
                 # DTR/RTS reset sequence to properly boot ESP32
+                # IMPORTANT: ESP32-S3 native USB CDC requires DTR=True for serial I/O
                 ser.dtr = False
                 ser.rts = False
                 time.sleep(0.1)
                 ser.dtr = True
                 ser.rts = True
                 time.sleep(0.1)
-                ser.dtr = False
                 ser.rts = False
+                # Keep DTR=True! ESP32-S3 USB CDC needs it for serial communication
                 time.sleep(2.0)  # Wait for ESP32 boot
                 
                 # Drain any boot messages

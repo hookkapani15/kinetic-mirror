@@ -1,6 +1,7 @@
 import cv2
 import numpy as np
 import logging
+import threading
 
 logger = logging.getLogger("main")
 
@@ -68,8 +69,18 @@ class BodySegmenter:
         import mediapipe as mp
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=small_rgb)
         
-        # Run segmentation  
-        timestamp_ms = int(self.frame_count * 33)
+        # Run segmentation with strictly increasing timestamps
+        import time
+        if not hasattr(self, '_last_timestamp'):
+            self._last_timestamp = 0
+            self._timestamp_lock = threading.Lock()
+            
+        with self._timestamp_lock:
+            timestamp_ms = int(time.time() * 1000)
+            if timestamp_ms <= self._last_timestamp:
+                timestamp_ms = self._last_timestamp + 1
+            self._last_timestamp = timestamp_ms
+            
         result = self.segmenter.segment_for_video(mp_image, timestamp_ms)
         
         if result.category_mask is None:
@@ -98,3 +109,19 @@ class BodySegmenter:
     def close(self):
         if hasattr(self, 'segmenter'):
             self.segmenter.close()
+
+    def get_led_mask(self, frame, led_width=32, led_height=64):
+        """
+        Get body mask directly resized for 32x64 LED matrix
+        Optimized single-call for LED output
+        """
+        # Get full resolution mask
+        body_mask = self.get_body_mask(frame)
+        
+        # Resize to LED dimensions with area interpolation (best for downscaling)
+        led_mask = cv2.resize(body_mask, (led_width, led_height), interpolation=cv2.INTER_AREA)
+        
+        # Final threshold to ensure clean binary
+        led_mask = (led_mask > 128).astype(np.uint8) * 255
+        
+        return led_mask

@@ -1,0 +1,147 @@
+"""
+Comprehensive UI Upgrade Script
+Transforms the GUI with modern design, animations, and better UX
+"""
+
+import os
+import shutil
+
+# Read original
+with open('apps/gui/main_original.py', 'r', encoding='utf-8') as f:
+    original = f.read()
+
+# Create comprehensive upgrade
+upgrade = '''"""
+Motor Control System - PREMIUM UI v2.0
+Advanced motor control with modern glassmorphism design
+"""
+
+import tkinter as tk
+from tkinter import ttk, messagebox
+import time
+import math
+import threading
+import random
+import struct
+import serial
+import serial.tools.list_ports
+import cv2
+from PIL import Image, ImageTk
+import numpy as np
+import subprocess
+import os
+import sys
+
+try:
+    import mediapipe as mp
+    MEDIAPIPE_AVAILABLE = True
+except ImportError:
+    MEDIAPIPE_AVAILABLE = False
+
+try:
+    from packages.mirror_core.simulation.mock_serial import get_virtual_device_instance
+except ImportError:
+    get_virtual_device_instance = None
+
+# ============== ADVANCED THEME SYSTEM ==============
+class ThemeManager:
+    """Premium theme management with multiple color schemes"""
+    THEMES = {
+        'modern_dark': {
+            'name': 'Modern Dark',
+            'bg_primary': '#0d1117', 'bg_secondary': '#161b22', 'bg_tertiary': '#21262d',
+            'bg_card': '#1c2128', 'bg_dark': '#0d1117', 'bg_medium': '#161b22', 'bg_light': '#21262d',
+            'accent_primary': '#58a6ff', 'accent_secondary': '#238636', 'accent_tertiary': '#8957e5',
+            'accent_danger': '#da3633', 'accent_warning': '#d29922', 'accent': '#58a6ff',
+            'text_primary': '#f0f6fc', 'text_secondary': '#8b949e', 'text_muted': '#6e7681',
+            'success': '#238636', 'error': '#da3633', 'warning': '#d29922',
+            'motor_body': '#21262d', 'motor_horn': '#58a6ff', 'motor_active': '#238636', 'motor_neutral': '#6e7681',
+            'border': '#30363d', 'grid_line': '#30363d', 'shadow': '#000000',
+        },
+        'midnight_purple': {
+            'name': 'Midnight Purple',
+            'bg_primary': '#1a1b2f', 'bg_secondary': '#23243a', 'bg_tertiary': '#2d2e45',
+            'bg_card': '#26273d', 'bg_dark': '#1a1b2f', 'bg_medium': '#23243a', 'bg_light': '#2d2e45',
+            'accent_primary': '#c084fc', 'accent_secondary': '#a855f7', 'accent_tertiary': '#818cf8',
+            'accent_danger': '#f472b6', 'accent_warning': '#fbbf24', 'accent': '#c084fc',
+            'text_primary': '#f8fafc', 'text_secondary': '#94a3b8', 'text_muted': '#64748b',
+            'success': '#34d399', 'error': '#f472b6', 'warning': '#fbbf24',
+            'motor_body': '#2d2e45', 'motor_horn': '#c084fc', 'motor_active': '#34d399', 'motor_neutral': '#475569',
+            'border': '#3f3f5f', 'grid_line': '#3f3f5f', 'shadow': '#0f1019',
+        },
+        'cyberpunk': {
+            'name': 'Cyberpunk',
+            'bg_primary': '#0a0a0f', 'bg_secondary': '#12121a', 'bg_tertiary': '#1a1a25',
+            'bg_card': '#151520', 'bg_dark': '#0a0a0f', 'bg_medium': '#12121a', 'bg_light': '#1a1a25',
+            'accent_primary': '#00f5ff', 'accent_secondary': '#ff006e', 'accent_tertiary': '#8338ec',
+            'accent_danger': '#ff006e', 'accent_warning': '#ffbe0b', 'accent': '#00f5ff',
+            'text_primary': '#ffffff', 'text_secondary': '#a0a0b0', 'text_muted': '#606070',
+            'success': '#00f5ff', 'error': '#ff006e', 'warning': '#ffbe0b',
+            'motor_body': '#1a1a25', 'motor_horn': '#00f5ff', 'motor_active': '#00f5ff', 'motor_neutral': '#404050',
+            'border': '#2a2a3a', 'grid_line': '#2a2a3a', 'shadow': '#000000',
+        },
+    }
+    
+    _current_theme = 'modern_dark'
+    _listeners = []
+    
+    @classmethod
+    def get_theme(cls):
+        return cls.THEMES.get(cls._current_theme, cls.THEMES['modern_dark'])
+    
+    @classmethod
+    def set_theme(cls, theme_name):
+        if theme_name in cls.THEMES:
+            cls._current_theme = theme_name
+            for cb in cls._listeners:
+                try:
+                    cb(theme_name)
+                except:
+                    pass
+            return True
+        return False
+    
+    @classmethod
+    def add_listener(cls, callback):
+        cls._listeners.append(callback)
+    
+    @classmethod
+    def get_theme_names(cls):
+        return [(k, v['name']) for k, v in cls.THEMES.items()]
+
+# Global colors reference
+COLORS = ThemeManager.get_theme()
+
+# ============== UTILITY FUNCTIONS ==============
+def hex_to_rgb(hex_color):
+    hex_color = hex_color.lstrip('#')
+    return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
+
+def lighten(hex_color, factor=0.2):
+    r, g, b = hex_to_rgb(hex_color)
+    r = min(255, int(r + (255 - r) * factor))
+    g = min(255, int(g + (255 - g) * factor))
+    b = min(255, int(b + (255 - b) * factor))
+    return f'#{r:02x}{g:02x}{b:02x}'
+
+def darken(hex_color, factor=0.2):
+    r, g, b = hex_to_rgb(hex_color)
+    r = int(r * (1 - factor))
+    g = int(g * (1 - factor))
+    b = int(b * (1 - factor))
+    return f'#{r:02x}{g:02x}{b:02x}'
+
+# ESP32 Identifiers
+ESP32_IDS = [(0x303A, 0x1001), (0x303A, 0x0002), (0x10C4, 0xEA60), (0x1A86, 0x7523), (0x1A86, 0x55D4), (0x0403, 0x6001)]
+FIRMWARE_DIR = os.path.join(os.path.dirname(__file__), '..', '..', 'firmware', 'esp32')
+FIRMWARE_BIN = os.path.join(FIRMWARE_DIR, '.pio', 'build', 'esp32', 'firmware.bin')
+FIRMWARE_BIN_S3 = os.path.join(FIRMWARE_DIR, '.pio', 'build', 'esp32s3', 'firmware.bin')
+
+'''
+
+# Continue with the rest... but this is getting complex. Let me create a simpler but effective upgrade.
+
+with open('apps/gui/main.py', 'w', encoding='utf-8') as f:
+    f.write(upgrade)
+    
+print("Created base structure")
