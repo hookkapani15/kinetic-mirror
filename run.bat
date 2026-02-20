@@ -1,4 +1,5 @@
 @echo off
-echo Starting Mirror Motor Application...
-python -m apps.gui.main
+cd /d "%~dp0"
+set PYTHONPATH=%~dp0;%PYTHONPATH%
+python apps\gui\gui_motors.py
 pause
