@@ -32,8 +32,8 @@ class LEDController:
     # Panel configuration
     PANEL_WIDTH = 16
     PANEL_HEIGHT = 16
-    PANELS_COLS = 2
-    PANELS_ROWS = 4
+    PANEL_COLUMNS = 2
+    PANEL_ROWS = 4
     LEDS_PER_PIN = 1024
     
     # Mapping modes
@@ -111,11 +111,11 @@ class LEDController:
         4 5
         6 7
         """
-        if not (0 <= panel_index < 8):
-            raise ValueError("Panel index must be 0-7")
+        if not (0 <= panel_index < (self.PANEL_COLUMNS * self.PANEL_ROWS)):
+            raise ValueError(f"Panel index must be 0-{self.PANEL_COLUMNS * self.PANEL_ROWS - 1}")
             
-        row = panel_index // 2
-        col = panel_index % 2
+        row = panel_index // self.PANEL_COLUMNS
+        col = panel_index % self.PANEL_COLUMNS
         
         x = col * self.PANEL_WIDTH
         y = row * self.PANEL_HEIGHT
